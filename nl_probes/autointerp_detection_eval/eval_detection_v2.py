@@ -32,7 +32,7 @@ EXPLANATION_PROMPT = "Can you explain to me what this concept means?"
 
 
 def get_introspection_prompt(sae_layer: int, num_positions: int) -> str:
-    return f"{get_introspection_prefix(sae_layer, num_positions)}{EXPLANATION_PROMPT}"
+    return f"{get_introspection_prefix([sae_layer], num_positions)}{EXPLANATION_PROMPT}"
 
 
 class ModelInfo(BaseModel):

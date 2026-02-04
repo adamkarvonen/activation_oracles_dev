@@ -221,52 +221,55 @@ def create_vector_dataset(
         tokenized_prompts["input_ids"] = tokenized_prompts["input_ids"]
         tokenized_prompts["attention_mask"] = tokenized_prompts["attention_mask"]
 
-        for layer in act_layers:
-            for j in range(len(batch_datapoints)):
-                attn_mask_L = tokenized_prompts["attention_mask"][j].bool()
-                input_ids_L = tokenized_prompts["input_ids"][j, attn_mask_L]
-                L = len(input_ids_L)
-                end_offset = random.randint(max_end_offset, min_end_offset)
-                end_pos = L + end_offset
+        for j in range(len(batch_datapoints)):
+            attn_mask_L = tokenized_prompts["attention_mask"][j].bool()
+            input_ids_L = tokenized_prompts["input_ids"][j, attn_mask_L]
+            L = len(input_ids_L)
+            end_offset = random.randint(max_end_offset, min_end_offset)
+            end_pos = L + end_offset
 
-                assert L > 0, f"L={L}"
-                assert end_pos > 0, f"end_pos={end_pos}"
+            assert L > 0, f"L={L}"
+            assert end_pos > 0, f"end_pos={end_pos}"
 
-                k = random.randint(min_window_size, max_window_size)
-                k = min(k, end_pos + 1)
-                assert k > 0, f"k={k}"
-                begin_pos = end_pos - k + 1
-                positions_K = list(range(begin_pos, end_pos + 1))
-                assert len(positions_K) == k
+            k = random.randint(min_window_size, max_window_size)
+            k = min(k, end_pos + 1)
+            assert k > 0, f"k={k}"
+            begin_pos = end_pos - k + 1
+            positions_K = list(range(begin_pos, end_pos + 1))
+            assert len(positions_K) == k
 
-                # assert tokenized_prompts["input_ids"][j][offset + 1] == tokenizer.eos_token_id
-                if debug_print:
-                    view_tokens(input_ids_L, tokenizer, positions_K[-1])
-                classification_prompt = f"{batch_datapoints[j].classification_prompt}"
+            # assert tokenized_prompts["input_ids"][j][offset + 1] == tokenizer.eos_token_id
+            if debug_print:
+                view_tokens(input_ids_L, tokenizer, positions_K[-1])
+            classification_prompt = f"{batch_datapoints[j].classification_prompt}"
 
-                if save_acts is False:
-                    acts_KD = None
-                else:
+            if save_acts is False:
+                acts_BD = None
+            else:
+                acts_layers = []
+                for layer in act_layers:
                     acts_LD = acts_BLD_by_layer_dict[layer][j, attn_mask_L]
                     acts_KD = acts_LD[positions_K]
                     assert acts_KD.shape[0] == k
+                    acts_layers.append(acts_KD)
+                acts_BD = torch.cat(acts_layers, dim=0)
 
-                training_data_point = create_training_datapoint(
-                    datapoint_type=datapoint_type,
-                    prompt=classification_prompt,
-                    target_response=batch_datapoints[j].target_response,
-                    layer=layer,
-                    num_positions=k,
-                    tokenizer=tokenizer,
-                    acts_BD=acts_KD,
-                    feature_idx=-1,
-                    context_input_ids=input_ids_L,
-                    context_positions=positions_K,
-                    ds_label=batch_datapoints[j].ds_label,
-                )
-                if training_data_point is None:
-                    continue
-                training_data.append(training_data_point)
+            training_data_point = create_training_datapoint(
+                datapoint_type=datapoint_type,
+                prompt=classification_prompt,
+                target_response=batch_datapoints[j].target_response,
+                layers=act_layers,
+                num_positions=k,
+                tokenizer=tokenizer,
+                acts_BD=acts_BD,
+                feature_idx=-1,
+                context_input_ids=input_ids_L,
+                context_positions=positions_K,
+                ds_label=batch_datapoints[j].ds_label,
+            )
+            if training_data_point is None:
+                continue
+            training_data.append(training_data_point)
 
     return training_data
 

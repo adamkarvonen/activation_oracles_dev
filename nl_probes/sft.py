@@ -21,6 +21,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenize
 from transformers.optimization import get_linear_schedule_with_warmup
 import torch.distributed as dist
 import wandb
+from huggingface_hub import upload_file
 
 import nl_probes.dataset_classes.classification as classification
 from nl_probes.utils.steering_hooks import (
@@ -54,6 +55,7 @@ from nl_probes.utils.dataset_utils import (
     materialize_missing_steering_vectors,
 )
 from nl_probes.utils.eval import run_evaluation, score_eval_responses
+from nl_probes.utils.mlao_utils import MLAO_CONFIG_FILENAME, assert_eval_datapoint_layers, write_mlao_config
 
 
 def push_lora_to_hf(
@@ -61,6 +63,7 @@ def push_lora_to_hf(
     tokenizer: AutoTokenizer,
     repo_id: str,
     private: bool,
+    mlao_config_path: str | Path,
     commit_message: str = "Upload LoRA adapter after training",
 ) -> None:
     """
@@ -72,12 +75,15 @@ def push_lora_to_hf(
         repo_id: HuggingFace repository ID (e.g., "username/repo-name")
         commit_message: Commit message for the upload
         private: Whether to make the repository private
+        mlao_config_path: Path to mlao_config.json for this adapter
 
     Returns:
-        bool: True if successful, False otherwise
+        None
     """
 
     print(f"Pushing LoRA adapter to Hugging Face Hub: {repo_id}")
+    mlao_config_path = Path(mlao_config_path)
+    assert mlao_config_path.exists(), f"Missing MLAO config: {mlao_config_path}"
 
     # Get the original model name to copy config from
     original_model_name = model.config._name_or_path
@@ -99,11 +105,18 @@ def push_lora_to_hf(
         private=private,
     )
 
+    upload_file(
+        path_or_fileobj=str(mlao_config_path),
+        path_in_repo=MLAO_CONFIG_FILENAME,
+        repo_id=repo_id,
+        commit_message="Add MLAO config",
+    )
+
     # Copy config.json from the original model
     try:
         import tempfile
 
-        from huggingface_hub import hf_hub_download, upload_file
+        from huggingface_hub import hf_hub_download
 
         print(f"Copying config.json from original model: {original_model_name}")
 
@@ -245,6 +258,8 @@ def eval_all_datasets(
     model.eval()
     eval_results = {}
     for ds in eval_datasets:
+        for dp in eval_datasets[ds]:
+            assert_eval_datapoint_layers(dp, cfg.act_layers)
         eval_responses = run_evaluation(
             eval_data=eval_datasets[ds],
             model=model,
@@ -470,7 +485,14 @@ def train_model(
 
                 if global_step % cfg.save_steps == 0 and global_step > 0:
                     if rank == 0:
-                        model.save_pretrained(f"{cfg.save_dir}/step_{global_step}")
+                        step_dir = Path(cfg.save_dir) / f"step_{global_step}"
+                        model.save_pretrained(step_dir)
+                        write_mlao_config(
+                            step_dir,
+                            model_name=cfg.model_name,
+                            layer_percents=cfg.layer_percents,
+                            act_layers=cfg.act_layers,
+                        )
                         if cfg.hf_push_to_hub and cfg.hf_repo_id:
                             print("Pushing LoRA adapter to Hugging Face Hub...")
                             push_lora_to_hf(
@@ -478,6 +500,7 @@ def train_model(
                                 tokenizer=tokenizer,
                                 repo_id=cfg.hf_repo_id + f"-step-{global_step}",
                                 private=cfg.hf_private_repo,
+                                mlao_config_path=step_dir / MLAO_CONFIG_FILENAME,
                                 commit_message=(f"SAE introspection LoRA - {cfg.wandb_run_name} - step {global_step}"),
                             )
                             print("Pushed LoRA adapter to Hugging Face Hub.")
@@ -491,7 +514,14 @@ def train_model(
     # Save final model
     if rank == 0:
         print("Saving final model...")
-        model.save_pretrained(f"{cfg.save_dir}/final")
+        final_dir = Path(cfg.save_dir) / "final"
+        model.save_pretrained(final_dir)
+        write_mlao_config(
+            final_dir,
+            model_name=cfg.model_name,
+            layer_percents=cfg.layer_percents,
+            act_layers=cfg.act_layers,
+        )
 
         # Final evaluation
         print("Running final evaluation...")
@@ -507,6 +537,7 @@ def train_model(
                 repo_id=cfg.hf_repo_id,
                 commit_message=f"SAE introspection LoRA - {cfg.wandb_run_name} - final model",
                 private=cfg.hf_private_repo,
+                mlao_config_path=final_dir / MLAO_CONFIG_FILENAME,
             )
     dist.barrier()
 
@@ -988,7 +1019,7 @@ if __name__ == "__main__":
             )
 
             # for debugging
-            # all_training_data = all_training_data[:100]
+            # all_training_data = all_training_data[:10_000]
             # eval_keys = list(all_eval_data.keys())
             # assert len(eval_keys) == 1
             # eval_key = eval_keys[0]
