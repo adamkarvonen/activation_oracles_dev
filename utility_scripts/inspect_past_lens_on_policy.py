@@ -27,6 +27,64 @@ def decode_token(tokenizer: AutoTokenizer, token_id: int) -> str:
     return tokenizer.decode([token_id], skip_special_tokens=False).replace("\n", "\\n")
 
 
+def infer_direction(prompt_text: str) -> str:
+    if "previous" in prompt_text:
+        return "past"
+    if "next" in prompt_text and "generated" in prompt_text:
+        return "future_generated"
+    return "unknown"
+
+
+def extract_task_instruction(prompt_text: str) -> str:
+    needles = [
+        "Can you predict the previous",
+        "Can you predict the next",
+    ]
+    for needle in needles:
+        start = prompt_text.find(needle)
+        if start >= 0:
+            end = prompt_text.find("<|im_end|>", start)
+            if end < 0:
+                end = len(prompt_text)
+            return prompt_text[start:end].strip()
+    return prompt_text.strip()
+
+
+def render_token_table(
+    tokenizer: AutoTokenizer,
+    context_ids: list[int],
+    act_start: int,
+    act_end: int,
+    context_window: int,
+) -> list[str]:
+    view_start = max(0, act_start - context_window)
+    view_end = min(len(context_ids), act_end + context_window + 1)
+    lines: list[str] = []
+    lines.append(
+        f"Token Table Around Activation Window: showing context[{view_start}:{view_end}] "
+        f"(window is [{act_start}:{act_end}])"
+    )
+    lines.append("  idx    tok_id   mark  token")
+
+    for idx in range(view_start, view_end):
+        mark = "."
+        in_window = act_start <= idx <= act_end
+        if in_window:
+            mark = "A"
+        if idx == act_start:
+            mark = "S"
+        if idx == act_end:
+            mark = "E"
+        if act_start == act_end and idx == act_start:
+            mark = "SE"
+
+        token_str = decode_token(tokenizer, context_ids[idx])
+        lines.append(f"  {idx:5d}  {context_ids[idx]:7d}   {mark:>2}   {token_str}")
+
+    lines.append("  legend: S=start of activation window, E=end, A=inside window")
+    return lines
+
+
 def build_context_table_rows(
     tokenizer: AutoTokenizer,
     context_ids: list[int],
@@ -40,7 +98,9 @@ def build_context_table_rows(
         token_str = html.escape(tokenizer.decode([token_id], skip_special_tokens=False))
         marker = "*" if idx in pos_set else ""
         row_class = ' class="selected"' if idx in pos_set else ""
-        rows.append(f"<tr{row_class}><td>{idx}</td><td>{token_id}</td><td>{marker}</td><td><code>{token_str}</code></td></tr>")
+        rows.append(
+            f"<tr{row_class}><td>{idx}</td><td>{token_id}</td><td>{marker}</td><td><code>{token_str}</code></td></tr>"
+        )
 
     if len(context_ids) > max_rows:
         rows.append(
@@ -50,7 +110,9 @@ def build_context_table_rows(
     return rows
 
 
-def summarize_datapoint(dp: TrainingDataPoint, tokenizer: AutoTokenizer, idx: int, max_context_rows: int) -> tuple[str, str]:
+def summarize_datapoint(
+    dp: TrainingDataPoint, tokenizer: AutoTokenizer, idx: int, max_context_rows: int
+) -> tuple[str, str]:
     first_target_idx = next((i for i, x in enumerate(dp.labels) if x != -100), len(dp.labels))
 
     prompt_ids = dp.input_ids[:first_target_idx]
@@ -118,23 +180,6 @@ def summarize_datapoint(dp: TrainingDataPoint, tokenizer: AutoTokenizer, idx: in
     return "\n".join(console), card
 
 
-def format_context_window_text(
-    tokenizer: AutoTokenizer,
-    context_ids: list[int],
-    center_idx: int,
-    window: int,
-) -> list[str]:
-    start = max(0, center_idx - window)
-    end = min(len(context_ids), center_idx + window + 1)
-
-    lines: list[str] = [f"    Window [{start}:{end}] around context index {center_idx}:"]
-    for i in range(start, end):
-        marker = "<ACT>" if i == center_idx else "     "
-        tok = decode_token(tokenizer, context_ids[i])
-        lines.append(f"      {marker} idx={i:4d} id={context_ids[i]:7d} tok={tok}")
-    return lines
-
-
 def build_text_report(
     dp: TrainingDataPoint,
     tokenizer: AutoTokenizer,
@@ -147,51 +192,106 @@ def build_text_report(
 
     prompt_text = decode_tokens(tokenizer, prompt_ids)
     target_text = decode_tokens(tokenizer, target_ids)
+    full_sample_text = decode_tokens(tokenizer, dp.input_ids)
 
     context_ids = dp.context_input_ids
     context_positions = dp.context_positions
 
     assert context_ids is not None
     assert context_positions is not None
+    assert len(dp.meta_info) > 0, f"Sample {idx}: expected meta_info to be populated"
+    assert "direction" in dp.meta_info, f"Sample {idx}: meta_info missing 'direction'"
 
-    direction = "unknown"
-    if "previous" in prompt_text:
-        direction = "past"
-    if "next" in prompt_text and "generated" in prompt_text:
-        direction = "future_generated"
+    direction = dp.meta_info["direction"]
+    task_instruction = extract_task_instruction(prompt_text)
+    act_start = min(context_positions)
+    act_end = max(context_positions)
+    assert act_end - act_start + 1 == len(context_positions), (
+        f"Sample {idx}: context_positions are expected to be contiguous, got {context_positions}"
+    )
+    assert context_positions == list(range(act_start, act_end + 1)), (
+        f"Sample {idx}: context_positions are expected to be sorted contiguous indices, got {context_positions}"
+    )
+
+    context_before_window = context_ids[max(0, act_start - context_window) : act_start]
+    act_window_ids = context_ids[act_start : act_end + 1]
+    target_token_ids = target_ids
 
     lines: list[str] = []
-    lines.append("=" * 120)
-    lines.append(f"Sample {idx}")
-    lines.append("=" * 120)
-    lines.append(f"direction: {direction}")
-    lines.append(f"datapoint_type: {dp.datapoint_type}")
-    lines.append(f"layers: {dp.layers}")
-    lines.append(f"num_positions: {len(context_positions)}")
-    lines.append(f"input_len: {len(dp.input_ids)}")
-    lines.append(f"prompt_len: {len(prompt_ids)}")
-    lines.append(f"target_len: {len(target_ids)}")
-    lines.append(f"selected_context_positions: {context_positions}")
+    lines.append("#" * 120)
+    lines.append(f"SAMPLE {idx}")
+    lines.append("#" * 120)
+    lines.append(f"Direction: {direction}")
+    lines.append(f"Datapoint Type: {dp.datapoint_type}")
+    lines.append(f"Layers: {dp.layers}")
+    lines.append(f"Activation Positions: {len(context_positions)}")
+    lines.append(f"Activation Window: [{act_start}:{act_end}]")
+    lines.append(f"Context Length: {len(context_ids)}")
+    lines.append(f"Instruction Prompt Length: {len(prompt_ids)}")
+    lines.append(f"Target Length: {len(target_ids)}")
+    lines.append(f"Sample Source: {dp.meta_info['sample_source']}")
+    lines.append(f"System Prompt Injected: {dp.meta_info['system_prompt_injected']}")
+    lines.append(
+        f"Layout: context[0:{act_end + 1}] contains activation window; target starts at conceptual index {act_end + 1}"
+    )
     lines.append("")
-    lines.append("--- Prompt Text (Decoded) ---")
-    lines.append(prompt_text)
+    lines.append("METADATA")
+    lines.append(str(dict(dp.meta_info)))
     lines.append("")
-    lines.append("--- Target Text (Decoded) ---")
+    lines.append("TASK PROMPT (training instruction)")
+    lines.append(task_instruction)
+    lines.append("")
+    lines.append("ENTIRE SAMPLE (decoded from input_ids)")
+    lines.append(full_sample_text)
+    lines.append("")
+    lines.append("TARGET TOKENS (what model should output)")
+    lines.append(f"target_token_ids: {target_token_ids}")
     lines.append(target_text)
     lines.append("")
-    lines.append("--- Context Prompt (Decoded) ---")
+    lines.append("FULL CONTEXT TEXT (decoded from context_input_ids)")
     lines.append(tokenizer.decode(context_ids, skip_special_tokens=False))
     lines.append("")
-    lines.append("--- Selected Activation Positions In Context ---")
-    lines.append(str(context_positions))
-
-    for pos in context_positions:
-        assert 0 <= pos < len(context_ids), (
-            f"Datapoint {idx}: context position {pos} out of range for context length {len(context_ids)}"
+    # lines.append(f"CONTEXT BEFORE WINDOW (last {context_window} tokens)")
+    # lines.append(tokenizer.decode(context_before_window, skip_special_tokens=False))
+    # lines.append("")
+    lines.append("ACTIVATION WINDOW TEXT")
+    lines.append(tokenizer.decode(act_window_ids, skip_special_tokens=False))
+    lines.append(f"activation_window_token_ids: {act_window_ids}")
+    lines.append("")
+    if direction == "future_generated":
+        assert "vllm_prompt_len" in dp.meta_info, f"Sample {idx}: future sample missing 'vllm_prompt_len'"
+        assert "vllm_generated_len" in dp.meta_info, f"Sample {idx}: future sample missing 'vllm_generated_len'"
+        assert "vllm_generated_token_ids" in dp.meta_info, (
+            f"Sample {idx}: future sample missing 'vllm_generated_token_ids'"
         )
-        tok = decode_token(tokenizer, context_ids[pos])
-        lines.append(f"  context_idx={pos:4d} token_id={context_ids[pos]:7d} token={tok}")
-        lines.extend(format_context_window_text(tokenizer, context_ids, pos, context_window))
+        assert "vllm_generated_text" in dp.meta_info, f"Sample {idx}: future sample missing 'vllm_generated_text'"
+        assert "vllm_finish_reason" in dp.meta_info, f"Sample {idx}: future sample missing 'vllm_finish_reason'"
+        vllm_prompt_len = dp.meta_info["vllm_prompt_len"]
+        vllm_generated_len = dp.meta_info["vllm_generated_len"]
+        vllm_generated_token_ids = dp.meta_info["vllm_generated_token_ids"]
+        vllm_generated_text = dp.meta_info["vllm_generated_text"]
+        vllm_finish_reason = dp.meta_info["vllm_finish_reason"]
+        assert isinstance(vllm_prompt_len, int), f"Sample {idx}: vllm_prompt_len must be int"
+        assert isinstance(vllm_generated_len, int), f"Sample {idx}: vllm_generated_len must be int"
+        assert isinstance(vllm_generated_token_ids, list), f"Sample {idx}: vllm_generated_token_ids must be list"
+        assert isinstance(vllm_generated_text, str), f"Sample {idx}: vllm_generated_text must be str"
+        assert isinstance(vllm_finish_reason, str), f"Sample {idx}: vllm_finish_reason must be str"
+        assert 0 <= vllm_prompt_len <= len(context_ids), (
+            f"Sample {idx}: vllm_prompt_len={vllm_prompt_len} out of bounds for context_len={len(context_ids)}"
+        )
+        lines.append("VLLM PROMPT TEXT (context_input_ids[:vllm_prompt_len])")
+        lines.append(tokenizer.decode(context_ids[:vllm_prompt_len], skip_special_tokens=False))
+        lines.append("")
+        lines.append("VLLM GENERATED CONTEXT TEXT (context_input_ids[vllm_prompt_len:])")
+        lines.append(tokenizer.decode(context_ids[vllm_prompt_len:], skip_special_tokens=False))
+        lines.append("")
+        lines.append("VLLM FULL GENERATED RESPONSE (all generated tokens)")
+        lines.append(f"vllm_finish_reason: {vllm_finish_reason}")
+        lines.append(f"vllm_generated_len: {vllm_generated_len}")
+        lines.append(f"vllm_generated_token_ids: {vllm_generated_token_ids}")
+        lines.append(vllm_generated_text)
+    lines.append("")
+    lines.extend(render_token_table(tokenizer, context_ids, act_start, act_end, context_window))
 
     return "\n".join(lines)
 
@@ -246,7 +346,9 @@ def main() -> None:
     parser.add_argument("--print-summaries", action="store_true")
     args = parser.parse_args()
 
-    dataset_path = args.dataset_path if args.dataset_path is not None else find_latest_past_lens_file(args.dataset_folder)
+    dataset_path = (
+        args.dataset_path if args.dataset_path is not None else find_latest_past_lens_file(args.dataset_folder)
+    )
     assert dataset_path.exists(), f"Dataset file not found: {dataset_path}"
 
     saved = torch.load(dataset_path)
@@ -276,7 +378,15 @@ def main() -> None:
         print("\n\n".join(console_chunks))
 
     args.txt_out.parent.mkdir(parents=True, exist_ok=True)
-    args.txt_out.write_text("\n\n".join(text_chunks))
+    header_lines = [
+        "Past Lens On-Policy Inspection Report",
+        f"dataset_path: {dataset_path}",
+        f"model_name: {model_name}",
+        f"total_datapoints: {len(datapoints)}",
+        f"sampled_indices: {chosen_indices}",
+        "",
+    ]
+    args.txt_out.write_text("\n".join(header_lines) + "\n\n".join(text_chunks))
     print(f"Wrote TXT report to: {args.txt_out}")
 
     if args.html_out is not None:

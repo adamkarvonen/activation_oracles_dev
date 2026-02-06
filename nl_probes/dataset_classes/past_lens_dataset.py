@@ -5,7 +5,7 @@ import random
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
-from typing import Generator, Literal
+from typing import Any, Generator, Literal
 
 import torch
 from datasets import load_dataset
@@ -26,6 +26,9 @@ from nl_probes.utils.dataset_utils import (
     get_introspection_prefix,
 )
 
+ENGLISH_ONLY_PRETRAIN_LANGUAGE = "en"
+ENGLISH_ONLY_CHAT_LANGUAGE = "English"
+
 
 @dataclass
 class PastLensDatasetConfig(BaseDatasetConfig):
@@ -41,21 +44,31 @@ class PastLensDatasetConfig(BaseDatasetConfig):
 
     future_chat_system_prompt_prob: float = 0.5
     system_prompt_path: str = "datasets/latentqa_datasets/train/system.json"
+    english_only_temp_filter: bool = False
 
 
 @dataclass
 class PretrainSample:
     source: Literal["pretrain"]
     text: str
+    language: str
 
 
 @dataclass
 class ChatSample:
     source: Literal["chat"]
     conversation: list[dict[str, str]]
+    language: str
 
 
 MixedDatasetSample = PretrainSample | ChatSample
+
+
+@dataclass
+class RenderedSample:
+    rendered_input: str
+    source: Literal["pretrain", "chat"]
+    system_prompt_injected: bool
 
 
 @dataclass
@@ -64,6 +77,8 @@ class FutureGenerationCandidate:
     k_tokens: int
     layers: list[int]
     k_acts: int
+    sample_source: Literal["pretrain", "chat"]
+    system_prompt_injected: bool
 
 
 @dataclass
@@ -148,12 +163,16 @@ def hf_mixed_dataset_to_generator(
     def gen() -> Generator[MixedDatasetSample, None, None]:
         while True:
             for _ in range(n_pretrain):
-                sample = next(pretrain_ds)[pretrain_key]
-                yield PretrainSample(source="pretrain", text=sample)
+                pretrain_row = next(pretrain_ds)
+                sample = pretrain_row[pretrain_key]
+                language = pretrain_row["language"]
+                yield PretrainSample(source="pretrain", text=sample, language=language)
 
             for _ in range(n_chat):
-                sample = next(chat_ds)[chat_key]
-                yield ChatSample(source="chat", conversation=sample)
+                chat_row = next(chat_ds)
+                sample = chat_row[chat_key]
+                language = chat_row["language"]
+                yield ChatSample(source="chat", conversation=sample, language=language)
 
     return gen()
 
@@ -196,9 +215,13 @@ def render_sample_to_text(
     bos_token: str,
     system_prompts: list[str],
     future_chat_system_prompt_prob: float,
-) -> str | None:
+) -> RenderedSample | None:
     if sample.source == "pretrain":
-        return bos_token + sample.text
+        return RenderedSample(
+            rendered_input=bos_token + sample.text,
+            source="pretrain",
+            system_prompt_injected=False,
+        )
 
     filtered_messages = [
         {"role": message["role"], "content": message["content"]}
@@ -227,11 +250,15 @@ def render_sample_to_text(
         prefix_len = random.randint(1, len(filtered_messages))
         chat_messages = filtered_messages[:prefix_len]
 
-    return tokenizer.apply_chat_template(
-        chat_messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False,
+    return RenderedSample(
+        rendered_input=tokenizer.apply_chat_template(
+            chat_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        ),
+        source="chat",
+        system_prompt_injected=inject_system_prompt,
     )
 
 def build_past_ready_candidate(
@@ -277,6 +304,7 @@ def create_training_datapoint_from_target_token_ids(
     feature_idx: int,
     context_input_ids: list[int],
     context_positions: list[int],
+    meta_info: dict[str, Any],
 ) -> TrainingDataPoint:
     prefix = get_introspection_prefix(layers, num_positions)
     assert prefix not in prompt, f"Prefix {prefix} found in prompt {prompt}"
@@ -318,7 +346,7 @@ def create_training_datapoint_from_target_token_ids(
         context_input_ids=context_input_ids,
         context_positions=context_positions,
         ds_label=None,
-        meta_info={},
+        meta_info=meta_info,
     )
 
     return training_data_point
@@ -372,6 +400,24 @@ def materialize_future_candidates(
             continue
 
         context_input_ids = combined_ids[: selected_act_end_idx + 1]
+        finish_reason = output.outputs[0].finish_reason
+        meta_info = {
+            "direction": "future_generated",
+            "sample_source": candidate.sample_source,
+            "system_prompt_injected": candidate.system_prompt_injected,
+            "k_tokens": candidate.k_tokens,
+            "k_acts": candidate.k_acts,
+            "vllm_prompt_len": prompt_len,
+            "vllm_generated_len": len(generated_token_ids),
+            "vllm_generated_token_ids": generated_token_ids,
+            "vllm_generated_text": tokenizer.decode(generated_token_ids, skip_special_tokens=False),
+            "vllm_finish_reason": str(finish_reason),
+            "context_len": len(context_input_ids),
+            "act_start": selected_act_begin_idx,
+            "act_end": selected_act_end_idx,
+            "target_start_idx": target_start_idx,
+            "target_end_idx_exclusive": target_end_idx,
+        }
         dp = create_training_datapoint_from_target_token_ids(
             datapoint_type=dataset_name,
             prompt=f"Can you predict the next {candidate.k_tokens} generated tokens that come after this?",
@@ -382,6 +428,7 @@ def materialize_future_candidates(
             feature_idx=-1,
             context_input_ids=context_input_ids,
             context_positions=selected_act_positions,
+            meta_info=meta_info,
         )
         added.append(dp)
         if len(added) >= max_to_add:
@@ -441,7 +488,15 @@ def collect_past_lens_on_policy_targets(
             k_acts = random.randint(custom_dataset_params.min_k_activations, custom_dataset_params.max_k_activations)
             layers = random.choice(act_layer_combinations)
 
-            rendered_input = render_sample_to_text(
+            if custom_dataset_params.english_only_temp_filter:
+                if sample.source == "pretrain":
+                    if sample.language != ENGLISH_ONLY_PRETRAIN_LANGUAGE:
+                        continue
+                else:
+                    if sample.language != ENGLISH_ONLY_CHAT_LANGUAGE:
+                        continue
+
+            rendered_sample = render_sample_to_text(
                 sample=sample,
                 direction=direction,
                 tokenizer=tokenizer,
@@ -450,11 +505,11 @@ def collect_past_lens_on_policy_targets(
                 system_prompts=system_prompts,
                 future_chat_system_prompt_prob=custom_dataset_params.future_chat_system_prompt_prob,
             )
-            if rendered_input is None:
+            if rendered_sample is None:
                 continue
 
             input_ids = tokenizer(
-                rendered_input,
+                rendered_sample.rendered_input,
                 return_tensors=None,
                 truncation=True,
                 max_length=custom_dataset_params.max_length,
@@ -473,6 +528,22 @@ def collect_past_lens_on_policy_targets(
                 if past_candidate is None:
                     continue
 
+                past_act_start = past_candidate.context_positions[0]
+                past_act_end = past_candidate.context_positions[-1]
+                past_target_start = past_act_start - past_candidate.k_tokens
+                past_target_end_exclusive = past_act_start
+                past_meta_info = {
+                    "direction": "past",
+                    "sample_source": rendered_sample.source,
+                    "system_prompt_injected": rendered_sample.system_prompt_injected,
+                    "k_tokens": past_candidate.k_tokens,
+                    "k_acts": past_candidate.k_acts,
+                    "context_len": len(past_candidate.context_input_ids),
+                    "act_start": past_act_start,
+                    "act_end": past_act_end,
+                    "target_start_idx": past_target_start,
+                    "target_end_idx_exclusive": past_target_end_exclusive,
+                }
                 dp = create_training_datapoint_from_target_token_ids(
                     datapoint_type=dataset_config.dataset_name,
                     prompt=f"Can you predict the previous {past_candidate.k_tokens} tokens that came before this?",
@@ -483,6 +554,7 @@ def collect_past_lens_on_policy_targets(
                     feature_idx=-1,
                     context_input_ids=past_candidate.context_input_ids,
                     context_positions=past_candidate.context_positions,
+                    meta_info=past_meta_info,
                 )
                 training_data.append(dp)
                 pbar.update(1)
@@ -497,6 +569,8 @@ def collect_past_lens_on_policy_targets(
                         k_tokens=k_tokens,
                         layers=layers,
                         k_acts=k_acts,
+                        sample_source=rendered_sample.source,
+                        system_prompt_injected=rendered_sample.system_prompt_injected,
                     )
                 )
 
