@@ -2,6 +2,7 @@ import os
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+import argparse
 import gc
 import json
 import math
@@ -839,13 +840,31 @@ def _ensure_datasets_exist(dataset_loaders: list[ActDatasetLoader]) -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--gen-only",
+        action="store_true",
+        help="Generate/load datasets on disk and exit before training.",
+    )
+    args = parser.parse_args()
+
     # for gemma: export TORCHDYNAMO_DISABLE=1
-    # Always initialize DDP (launch with torchrun, even for 1 GPU)
+    # Always initialize DDP for training (launch with torchrun, even for 1 GPU)
     # time delta of two hours because currently it can take 1 hour to build all datasets
-    dist.init_process_group(backend="nccl", timeout=timedelta(hours=2))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    torch.cuda.set_device(local_rank)
-    world_size = dist.get_world_size()
+    if args.gen_only:
+        torchrun_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        if torchrun_local_rank != 0:
+            print("Skipping dataset generation on non-zero LOCAL_RANK in --gen-only mode")
+            raise SystemExit(0)
+        local_rank = 0
+        world_size = 1
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)
+    else:
+        dist.init_process_group(backend="nccl", timeout=timedelta(hours=2))
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)
+        world_size = dist.get_world_size()
 
     main_train_size = 6000
     main_test_size = 250
@@ -1003,12 +1022,18 @@ if __name__ == "__main__":
 
             print(f"save dir: {cfg.save_dir}")
 
-            tokenizer = load_tokenizer(cfg.model_name)
-
             # Ensure only rank 0 performs any on-disk dataset creation
             if local_rank == 0:
                 _ensure_datasets_exist(loop_dataset_loaders)
-            dist.barrier()
+            if not args.gen_only:
+                dist.barrier()
+
+            if args.gen_only:
+                if local_rank == 0:
+                    print("Dataset generation complete (--gen-only); exiting before training.")
+                continue
+
+            tokenizer = load_tokenizer(cfg.model_name)
 
             all_training_data, all_eval_data = build_datasets(
                 cfg, dataset_loaders=loop_dataset_loaders, window_mult=cfg.window_mult
@@ -1037,4 +1062,5 @@ if __name__ == "__main__":
             )
 
     # Clean up DDP
-    dist.destroy_process_group()
+    if not args.gen_only:
+        dist.destroy_process_group()
