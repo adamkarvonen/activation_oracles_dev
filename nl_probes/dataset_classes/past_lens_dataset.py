@@ -261,6 +261,7 @@ def render_sample_to_text(
         system_prompt_injected=inject_system_prompt,
     )
 
+
 def build_past_ready_candidate(
     input_ids: list[int],
     k_tokens: int,
@@ -366,7 +367,7 @@ def materialize_future_candidates(
     outputs = llm.generate(
         prompts=[{"prompt_token_ids": c.vllm_prompt_ids} for c in candidates],
         sampling_params=sampling_params,
-        use_tqdm=False,
+        use_tqdm=True,
     )
 
     added: list[TrainingDataPoint] = []
@@ -470,7 +471,9 @@ def collect_past_lens_on_policy_targets(
 
     system_prompts = load_system_prompts(custom_dataset_params.system_prompt_path)
 
-    llm = LLM(model=dataset_config.model_name)
+    gc.collect()
+    torch.cuda.empty_cache()
+    llm = LLM(model=dataset_config.model_name, gpu_memory_utilization=0.6)
     sampling_params = SamplingParams(
         temperature=1.0,
         max_tokens=custom_dataset_params.vllm_max_new_tokens,
