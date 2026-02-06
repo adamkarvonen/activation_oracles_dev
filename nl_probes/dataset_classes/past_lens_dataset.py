@@ -64,8 +64,6 @@ class FutureGenerationCandidate:
     k_tokens: int
     layers: list[int]
     k_acts: int
-    context_input_ids: list[int]
-    context_positions: list[int]
 
 
 @dataclass
@@ -168,18 +166,6 @@ def load_system_prompts(system_prompt_path: str) -> list[str]:
     return prompts
 
 
-def select_chat_prefix(conversation: list[dict[str, str]]) -> list[dict[str, str]]:
-    filtered = [
-        {"role": message["role"], "content": message["content"]}
-        for message in conversation
-        if message["role"] in {"user", "assistant"}
-    ]
-    if len(filtered) == 0:
-        return []
-    prefix_len = random.randint(1, len(filtered))
-    return filtered[:prefix_len]
-
-
 def prepend_system_prompt_for_chat(
     model_name: str,
     chat_messages: list[dict[str, str]],
@@ -200,14 +186,6 @@ def prepend_system_prompt_for_chat(
         return updated
 
     return [{"role": "system", "content": system_prompt}] + chat_messages
-
-
-def make_past_prompt(k_tokens: int) -> str:
-    return f"Can you predict the previous {k_tokens} tokens that came before this?"
-
-
-def make_future_prompt(k_tokens: int) -> str:
-    return f"Can you predict the next {k_tokens} generated tokens that come after this?"
 
 
 def render_sample_to_text(
@@ -252,24 +230,9 @@ def render_sample_to_text(
     return tokenizer.apply_chat_template(
         chat_messages,
         tokenize=False,
-        add_generation_prompt=False,
+        add_generation_prompt=True,
         enable_thinking=False,
     )
-
-
-def tokenize_rendered_input(
-    tokenizer: AutoTokenizer,
-    rendered_input: str,
-    max_length: int,
-) -> list[int]:
-    return tokenizer(
-        rendered_input,
-        return_tensors=None,
-        truncation=True,
-        max_length=max_length,
-        add_special_tokens=False,
-    )["input_ids"]
-
 
 def build_past_ready_candidate(
     input_ids: list[int],
@@ -301,59 +264,6 @@ def build_past_ready_candidate(
         target_token_ids=target_token_ids,
         context_input_ids=context_input_ids,
         context_positions=selected_act_positions,
-    )
-
-
-def build_future_generation_candidate(
-    input_ids: list[int],
-    k_tokens: int,
-    layers: list[int],
-    k_acts: int,
-    max_vllm_context_tokens: int,
-) -> FutureGenerationCandidate | None:
-    seq_len = len(input_ids)
-    if seq_len < k_acts + 1:
-        return None
-
-    act_begin_min = 1
-    act_begin_max = seq_len - k_acts
-    if act_begin_max < act_begin_min:
-        return None
-
-    selected_act_begin_idx = random.randint(act_begin_min, act_begin_max)
-    selected_act_positions = list(range(selected_act_begin_idx, selected_act_begin_idx + k_acts))
-    context_cutoff = selected_act_positions[-1]
-
-    context_input_ids = input_ids[: context_cutoff + 1]
-    vllm_prompt_ids = context_input_ids
-    if len(vllm_prompt_ids) > max_vllm_context_tokens:
-        vllm_prompt_ids = vllm_prompt_ids[-max_vllm_context_tokens:]
-
-    return FutureGenerationCandidate(
-        vllm_prompt_ids=vllm_prompt_ids,
-        k_tokens=k_tokens,
-        layers=layers,
-        k_acts=k_acts,
-        context_input_ids=context_input_ids,
-        context_positions=selected_act_positions,
-    )
-
-
-def materialize_past_ready_candidate(
-    tokenizer: AutoTokenizer,
-    dataset_name: str,
-    candidate: PastReadyCandidate,
-) -> TrainingDataPoint:
-    return create_training_datapoint_from_target_token_ids(
-        datapoint_type=dataset_name,
-        prompt=make_past_prompt(candidate.k_tokens),
-        target_token_ids=candidate.target_token_ids,
-        layers=candidate.layers,
-        num_positions=candidate.k_acts,
-        tokenizer=tokenizer,
-        feature_idx=-1,
-        context_input_ids=candidate.context_input_ids,
-        context_positions=candidate.context_positions,
     )
 
 
@@ -433,23 +343,45 @@ def materialize_future_candidates(
 
     added: list[TrainingDataPoint] = []
     for candidate, output in zip(candidates, outputs, strict=True):
+        if len(output.outputs) == 0:
+            continue
         generated_token_ids = output.outputs[0].token_ids
-        if len(generated_token_ids) < candidate.k_tokens:
+        if len(generated_token_ids) == 0:
             continue
 
-        target_token_ids = generated_token_ids[: candidate.k_tokens]
-        prompt = make_future_prompt(candidate.k_tokens)
+        combined_ids = candidate.vllm_prompt_ids + generated_token_ids
+        prompt_len = len(candidate.vllm_prompt_ids)
+        combined_len = len(combined_ids)
 
+        # Choose activation window by its end index on prompt+generated tokens.
+        # We require the window to include at least one generated token and the
+        # target window to stay in generated tokens.
+        act_end_min = max(candidate.k_acts, prompt_len)
+        act_end_max = combined_len - candidate.k_tokens - 1
+        if act_end_max < act_end_min:
+            continue
+
+        selected_act_end_idx = random.randint(act_end_min, act_end_max)
+        selected_act_begin_idx = selected_act_end_idx - candidate.k_acts + 1
+        selected_act_positions = list(range(selected_act_begin_idx, selected_act_end_idx + 1))
+
+        target_start_idx = selected_act_end_idx + 1
+        target_end_idx = target_start_idx + candidate.k_tokens
+        target_token_ids = combined_ids[target_start_idx:target_end_idx]
+        if len(target_token_ids) != candidate.k_tokens:
+            continue
+
+        context_input_ids = combined_ids[: selected_act_end_idx + 1]
         dp = create_training_datapoint_from_target_token_ids(
             datapoint_type=dataset_name,
-            prompt=prompt,
+            prompt=f"Can you predict the next {candidate.k_tokens} generated tokens that come after this?",
             target_token_ids=target_token_ids,
             layers=candidate.layers,
             num_positions=candidate.k_acts,
             tokenizer=tokenizer,
             feature_idx=-1,
-            context_input_ids=candidate.context_input_ids,
-            context_positions=candidate.context_positions,
+            context_input_ids=context_input_ids,
+            context_positions=selected_act_positions,
         )
         added.append(dp)
         if len(added) >= max_to_add:
@@ -521,11 +453,15 @@ def collect_past_lens_on_policy_targets(
             if rendered_input is None:
                 continue
 
-            input_ids = tokenize_rendered_input(
-                tokenizer=tokenizer,
-                rendered_input=rendered_input,
+            input_ids = tokenizer(
+                rendered_input,
+                return_tensors=None,
+                truncation=True,
                 max_length=custom_dataset_params.max_length,
-            )
+                add_special_tokens=False,
+            )["input_ids"]
+            if len(input_ids) == 0:
+                continue
 
             if direction == "past":
                 past_candidate = build_past_ready_candidate(
@@ -537,24 +473,32 @@ def collect_past_lens_on_policy_targets(
                 if past_candidate is None:
                     continue
 
-                dp = materialize_past_ready_candidate(
+                dp = create_training_datapoint_from_target_token_ids(
+                    datapoint_type=dataset_config.dataset_name,
+                    prompt=f"Can you predict the previous {past_candidate.k_tokens} tokens that came before this?",
+                    target_token_ids=past_candidate.target_token_ids,
+                    layers=past_candidate.layers,
+                    num_positions=past_candidate.k_acts,
                     tokenizer=tokenizer,
-                    dataset_name=dataset_config.dataset_name,
-                    candidate=past_candidate,
+                    feature_idx=-1,
+                    context_input_ids=past_candidate.context_input_ids,
+                    context_positions=past_candidate.context_positions,
                 )
                 training_data.append(dp)
                 pbar.update(1)
             else:
-                future_candidate = build_future_generation_candidate(
-                    input_ids=input_ids,
-                    k_tokens=k_tokens,
-                    layers=layers,
-                    k_acts=k_acts,
-                    max_vllm_context_tokens=custom_dataset_params.max_vllm_context_tokens,
+                vllm_prompt_ids = input_ids
+                if len(vllm_prompt_ids) > custom_dataset_params.max_vllm_context_tokens:
+                    vllm_prompt_ids = vllm_prompt_ids[-custom_dataset_params.max_vllm_context_tokens :]
+
+                future_candidates.append(
+                    FutureGenerationCandidate(
+                        vllm_prompt_ids=vllm_prompt_ids,
+                        k_tokens=k_tokens,
+                        layers=layers,
+                        k_acts=k_acts,
+                    )
                 )
-                if future_candidate is None:
-                    continue
-                future_candidates.append(future_candidate)
 
             remaining_slots = num_datapoints - len(training_data)
             should_flush_future = remaining_slots <= len(future_candidates)
