@@ -72,6 +72,7 @@ if __name__ == "__main__":
         "temperature": 1.0,
         "max_new_tokens": 30,
     }
+    selected_layer_combination = [50]
 
     config = base_experiment.VerbalizerEvalConfig(
         model_name=model_name,
@@ -81,6 +82,7 @@ if __name__ == "__main__":
         full_seq_repeats=5,
         segment_repeats=5,
         segment_start_idx=segment_start,
+        selected_layer_combination=selected_layer_combination,
     )
 
     experiments_dir: str = "experiments/ssc_eval_results"
@@ -147,7 +149,10 @@ if __name__ == "__main__":
         verbalizer_results = []
         sanitized_verbalizer_name = None
         if verbalizer_lora_path is not None:
-            sanitized_verbalizer_name = base_experiment.load_lora_adapter(model, verbalizer_lora_path)
+            sanitized_verbalizer_name, verbalizer_training_config = base_experiment.load_oracle_adapter(
+                model, verbalizer_lora_path
+            )
+            base_experiment.assert_training_config_matches_verbalizer_eval_config(config, verbalizer_training_config)
 
         for target_lora_suffix in target_lora_suffixes:
             target_lora_path = None
@@ -156,7 +161,7 @@ if __name__ == "__main__":
 
             sanitized_target_name = None
             if target_lora_path is not None:
-                sanitized_target_name = base_experiment.load_lora_adapter(model, target_lora_path)
+                sanitized_target_name = base_experiment.load_plain_adapter(model, target_lora_path)
 
             print(f"Running verbalizer eval for verbalizer: {verbalizer_lora_path}, target: {target_lora_path}")
 
@@ -188,7 +193,7 @@ if __name__ == "__main__":
                 model=model,
                 tokenizer=tokenizer,
                 verbalizer_prompt_infos=verbalizer_prompt_infos,
-                verbalizer_lora_path=verbalizer_lora_path,
+                verbalizer_lora_path=sanitized_verbalizer_name,
                 target_lora_path=sanitized_target_name,
                 config=config,
                 device=device,

@@ -54,9 +54,10 @@ class LatentQADatasetLoader(ActDatasetLoader):
     def create_dataset(self) -> None:
         tokenizer = load_tokenizer(self.dataset_config.model_name)
 
-        layers = [
-            layer_percent_to_layer(self.dataset_config.model_name, layer_percent)
-            for layer_percent in self.dataset_config.layer_percents
+        assert self.dataset_config.layer_combinations, "layer_combinations must be non-empty"
+        act_layer_combinations = [
+            [layer_percent_to_layer(self.dataset_config.model_name, layer_percent) for layer_percent in layer_combo]
+            for layer_combo in self.dataset_config.layer_combinations
         ]
 
         paths = latentqa_loader.DataPaths(
@@ -79,7 +80,8 @@ class LatentQADatasetLoader(ActDatasetLoader):
         training_data = []
 
         for dp in tqdm(ds, desc="Creating latentqa dataset"):
-            training_data.append(create_latentqa_training_datapoint(dp, tokenizer, layers, self.dataset_params))
+            act_layers = random.choice(act_layer_combinations)
+            training_data.append(create_latentqa_training_datapoint(dp, tokenizer, act_layers, self.dataset_params))
 
         self.save_dataset(training_data, "train")
 
@@ -164,7 +166,15 @@ def create_latentqa_training_datapoint(
 
 if __name__ == "__main__":
     model_name = "Qwen/Qwen3-8B"
-    config = DatasetLoaderConfig(LatentQADatasetConfig(), 100_000, 0, ["train"], model_name, [50], False)
+    config = DatasetLoaderConfig(
+        LatentQADatasetConfig(),
+        100_000,
+        0,
+        ["train"],
+        model_name,
+        [[50]],
+        False,
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 

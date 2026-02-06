@@ -21,7 +21,7 @@ class DatasetLoaderConfig:
     num_test: int
     splits: list[str]
     model_name: str
-    layer_percents: list[int]
+    layer_combinations: list[list[int]]
     save_acts: bool
     batch_size: int
     dataset_name: str = ""

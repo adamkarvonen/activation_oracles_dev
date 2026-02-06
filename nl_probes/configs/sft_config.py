@@ -1,23 +1,56 @@
 import datetime
+import json
+import subprocess
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
-from huggingface_hub import login, whoami
+from huggingface_hub import hf_hub_download, login, whoami
 
 from nl_probes.dataset_classes.act_dataset_manager import ActDatasetLoader, DatasetLoaderConfig
+from nl_probes.utils.dataset_utils import SPECIAL_TOKEN
 from nl_probes.utils.common import layer_percent_to_layer
+
+TRAINING_CONFIG_FILENAME = "ao_config.json"
+TRAINING_CONFIG_SCHEMA_VERSION = 1
+DEFAULT_PREFIX_TEMPLATE = "Layer: {layer}\\n{special_token} * {num_positions} \\n"
+
+
+def dataset_loader_name_from_config(dataset_config: DatasetLoaderConfig) -> str:
+    dataset_name = dataset_config.dataset_name
+    params = dataset_config.custom_dataset_params
+
+    if dataset_name == "past_lens":
+        return "past_lens"
+
+    if dataset_name == "latentqa":
+        return "latentqa"
+
+    if dataset_name.startswith("classification_"):
+        return dataset_name
+
+    # Draft configs may set dataset_name directly without loader normalization.
+    if hasattr(params, "classification_dataset_name"):
+        return f"classification_{params.classification_dataset_name}"
+
+    return dataset_name
 
 
 @dataclass
 class SelfInterpTrainingConfig:
+    layer_combinations: list[list[int]]
+    act_layer_combinations: list[list[int]] = field(default_factory=list)
+    schema_version: int = TRAINING_CONFIG_SCHEMA_VERSION
+    special_token: str = SPECIAL_TOKEN
+    prefix_template: str = DEFAULT_PREFIX_TEMPLATE
+
     # --- Model ---
     model_name: str = "Qwen/Qwen3-8B"
     hook_onto_layer: int = 1
-    layer_percents: list[int] = field(default_factory=lambda: [25, 50, 75])
-    act_layers: list[int] = field(default_factory=list)  # derived if empty
 
     # --- Data / experiment ---
     dataset_configs: list[dict] = field(default_factory=list)
+    dataset_loader_names: list[str] = field(default_factory=list)
     use_decoder_vectors: bool = True
     generation_kwargs: dict[str, Any] = field(default_factory=lambda: {"do_sample": False, "max_new_tokens": 20})
     steering_coefficient: float = 1.0
@@ -51,6 +84,8 @@ class SelfInterpTrainingConfig:
     load_lora_path: str | None = None
 
     # --- Tracking ---
+    created_at_utc: str = ""
+    git_commit: str = ""
     wandb_project: str = "sae_introspection"
     wandb_run_name: str = ""  # derived if empty
     wandb_suffix: str = ""
@@ -65,13 +100,30 @@ class SelfInterpTrainingConfig:
     positive_negative_examples: bool = False
 
     def finalize(self, dataset_loaders: list[ActDatasetLoader]) -> "SelfInterpTrainingConfig":
+        if not self.created_at_utc:
+            self.created_at_utc = datetime.datetime.now(datetime.UTC).isoformat()
+        if not self.git_commit:
+            self.git_commit = get_git_commit_hash()
+
         self.dataset_configs = [asdict(dataset_loader.dataset_config) for dataset_loader in dataset_loaders]
-        # act_layers from percents if caller did not set them directly
-        if not self.act_layers:
-            self.act_layers = [layer_percent_to_layer(self.model_name, p) for p in self.layer_percents]
+        self.dataset_loader_names = [
+            dataset_loader_name_from_config(dataset_loader.dataset_config) for dataset_loader in dataset_loaders
+        ]
+        if not self.layer_combinations:
+            raise ValueError("layer_combinations must be provided")
+        if not self.act_layer_combinations:
+            self.act_layer_combinations = [
+                [layer_percent_to_layer(self.model_name, p) for p in combo] for combo in self.layer_combinations
+            ]
+        assert len(self.layer_combinations) == len(self.act_layer_combinations), (
+            "layer_combinations and act_layer_combinations must have the same length"
+        )
+        for lc, ac in zip(self.layer_combinations, self.act_layer_combinations, strict=True):
+            assert len(lc) == len(ac), "Each layer combination must match act layer combination length"
 
         # run name - stable and readable
-        layers_str = "-".join(map(str, self.act_layers))
+        primary_act_combo = self.act_layer_combinations[0]
+        layers_str = "-".join(map(str, primary_act_combo))
         default_run = f"{self.model_name}-layers_{layers_str}-decoder-{self.use_decoder_vectors}{self.wandb_suffix}"
         if not self.wandb_run_name:
             self.wandb_run_name = default_run
@@ -84,6 +136,24 @@ class SelfInterpTrainingConfig:
         if self.hf_push_to_hub and not self.hf_repo_id:
             self.hf_repo_id = get_hf_repo_id(self.hf_repo_name)
         return self
+
+
+def write_training_config(save_dir: str | Path, cfg: SelfInterpTrainingConfig) -> None:
+    save_path = Path(save_dir) / TRAINING_CONFIG_FILENAME
+    payload = asdict(cfg)
+    save_path.write_text(json.dumps(payload, indent=2))
+
+
+def read_training_config(path_or_repo: str) -> SelfInterpTrainingConfig:
+    p = Path(path_or_repo)
+    if p.exists():
+        if p.is_file():
+            return SelfInterpTrainingConfig(**json.loads(p.read_text()))
+        cfg_path = p / TRAINING_CONFIG_FILENAME
+        return SelfInterpTrainingConfig(**json.loads(cfg_path.read_text()))
+
+    cfg_path = hf_hub_download(repo_id=path_or_repo, filename=TRAINING_CONFIG_FILENAME)
+    return SelfInterpTrainingConfig(**json.loads(Path(cfg_path).read_text()))
 
 
 def get_hf_repo_id(hf_repo_name: str) -> str:
@@ -106,3 +176,10 @@ def get_hf_repo_id(hf_repo_name: str) -> str:
     hf_repo_id_computed = f"{owner}/{hf_repo_name}" if owner else hf_repo_name
 
     return hf_repo_id_computed
+
+
+def get_git_commit_hash() -> str:
+    return (
+        subprocess.check_output(["git", "rev-parse", "HEAD"], text=True)
+        .strip()
+    )

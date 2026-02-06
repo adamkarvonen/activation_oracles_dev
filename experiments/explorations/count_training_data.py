@@ -29,7 +29,7 @@ def mk_cfg(
     num_test: int,
     splits: list[str],
     model_name: str,
-    layer_percents: list[int],
+    layer_combinations: list[list[int]],
     save_acts: bool,
     batch_size: int,
 ) -> DatasetLoaderConfig:
@@ -39,7 +39,7 @@ def mk_cfg(
         num_test=num_test,
         splits=splits,
         model_name=model_name,
-        layer_percents=layer_percents,
+        layer_combinations=layer_combinations,
         save_acts=save_acts,
         batch_size=batch_size,
     )
@@ -48,7 +48,7 @@ def mk_cfg(
 def build_loader_groups_no_model(
     *,
     model_name: str,
-    layer_percents: list[int],
+    layer_combinations: list[list[int]],
     train_batch_size: int,
     save_acts: bool,
     classification_datasets: dict[str, dict[str, Any]],
@@ -68,7 +68,7 @@ def build_loader_groups_no_model(
             num_test=0,
             splits=["train"],
             model_name=model_name,
-            layer_percents=layer_percents,
+            layer_combinations=layer_combinations,
             save_acts=save_acts,
             batch_size=train_batch_size,
         )
@@ -84,7 +84,7 @@ def build_loader_groups_no_model(
             num_test=0,
             splits=["train"],
             model_name=model_name,
-            layer_percents=layer_percents,
+            layer_combinations=layer_combinations,
             save_acts=save_acts,
             batch_size=train_batch_size,
         )
@@ -97,7 +97,7 @@ def build_loader_groups_no_model(
             num_test=0,
             splits=["train"],
             model_name=model_name,
-            layer_percents=layer_percents,
+            layer_combinations=layer_combinations,
             save_acts=False,
             batch_size=train_batch_size,
         )
@@ -138,7 +138,7 @@ def build_loader_groups_no_model(
                     num_test=meta["num_test"],
                     splits=meta["splits"],
                     model_name=model_name,
-                    layer_percents=layer_percents,
+                    layer_combinations=layer_combinations,
                     save_acts=save_acts,
                     batch_size=bs,
                 ),
@@ -154,7 +154,7 @@ def build_loader_groups_no_model(
                     num_test=meta["num_test"],
                     splits=meta["splits"],
                     model_name=model_name,
-                    layer_percents=layer_percents,
+                    layer_combinations=layer_combinations,
                     save_acts=save_acts,
                     batch_size=train_batch_size,
                 ),
@@ -278,18 +278,18 @@ def main():
         "singular_plural": {"num_train": 0, "num_test": main_test_size, "splits": ["test"]},
     }
 
-    layer_percents = [25, 50, 75]
+    layer_combinations = [[25, 50, 75]]
     save_acts = False
     train_batch_size = 16  # Global batch size before DDP splitting
 
     print(f"Model: {model_name}")
-    print(f"Layer percents: {layer_percents}")
+    print(f"Layer combinations: {layer_combinations}")
     print("=" * 60)
 
     # Build loaders without model
     loader_groups = build_loader_groups_no_model(
         model_name=model_name,
-        layer_percents=layer_percents,
+        layer_combinations=layer_combinations,
         train_batch_size=train_batch_size,
         save_acts=save_acts,
         classification_datasets=classification_datasets,

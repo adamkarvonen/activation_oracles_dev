@@ -21,7 +21,8 @@ from nl_probes.dataset_classes.classification import (
 from nl_probes.utils.activation_utils import get_hf_submodule
 from nl_probes.utils.common import load_model, load_tokenizer, layer_percent_to_layer
 from nl_probes.utils.eval import parse_answer, run_evaluation
-from nl_probes.utils.mlao_utils import assert_eval_datapoint_layers, read_mlao_config
+from nl_probes.configs.sft_config import read_training_config
+from nl_probes.utils.dataset_utils import assert_eval_datapoint_layers
 from nl_probes.base_experiment import sanitize_lora_name
 
 # -----------------------------
@@ -119,8 +120,8 @@ CLASSIFICATION_DATASETS: dict[str, dict[str, Any]] = {
     "engels_wikidata_isresearcher": {"num_train": 0, "num_test": 250, "splits": ["test"]},
 }
 
-# Layer percents used together for MLAO evaluation
-DEFAULT_LAYER_PERCENTS = [25, 50, 75]
+# Layer combination used together for MLAO evaluation
+DEFAULT_LAYER_COMBINATION = [25, 50, 75]
 
 KEY_FOR_NONE = "original"
 
@@ -159,27 +160,39 @@ def get_batch_size(model_name: str) -> int:
     return BASE_BATCH_SIZE
 
 
-def get_layer_spec_for_lora(model_name: str, lora_path: str | None) -> tuple[list[int], list[int]]:
+def get_layer_specs_for_lora(model_name: str, lora_path: str | None) -> list[tuple[list[int], list[int]]]:
     if lora_path is None:
-        layer_percents = DEFAULT_LAYER_PERCENTS
-        act_layers = [layer_percent_to_layer(model_name, p) for p in layer_percents]
-        return layer_percents, act_layers
+        layer_combination = DEFAULT_LAYER_COMBINATION
+        act_layer_combination = [layer_percent_to_layer(model_name, p) for p in layer_combination]
+        return [(layer_combination, act_layer_combination)]
 
-    mlao_cfg = read_mlao_config(lora_path)
-    assert mlao_cfg["model_name"] == model_name, (
-        f"MLAO config model_name {mlao_cfg['model_name']} does not match {model_name}"
+    training_cfg = read_training_config(lora_path)
+    assert training_cfg.model_name == model_name, (
+        f"Training config model_name {training_cfg.model_name} does not match {model_name}"
     )
-    layer_percents = mlao_cfg["layer_percents"]
-    act_layers = mlao_cfg["act_layers"]
-    expected_layers = [layer_percent_to_layer(model_name, p) for p in layer_percents]
-    assert act_layers == expected_layers, f"MLAO act_layers {act_layers} do not match percents {layer_percents}"
-    return layer_percents, act_layers
+    layer_combinations = training_cfg.layer_combinations
+    act_layer_combinations = training_cfg.act_layer_combinations
+
+    assert len(layer_combinations) == len(act_layer_combinations), (
+        f"Layer combination mismatch: {len(layer_combinations)} perc combos vs "
+        f"{len(act_layer_combinations)} act combos"
+    )
+
+    layer_specs: list[tuple[list[int], list[int]]] = []
+    for layer_combination, act_layer_combination in zip(layer_combinations, act_layer_combinations, strict=True):
+        expected_layers = [layer_percent_to_layer(model_name, p) for p in layer_combination]
+        assert act_layer_combination == expected_layers, (
+            f"act_layers {act_layer_combination} do not match percents {layer_combination}"
+        )
+        layer_specs.append((layer_combination, act_layer_combination))
+
+    return layer_specs
 
 
-def load_datasets_for_layer_percents(
-    model_name: str, layer_percents: list[int], model_kwargs: dict, model=None
+def load_datasets_for_layer_combination(
+    model_name: str, layer_combination: list[int], model_kwargs: dict, model=None
 ) -> dict[str, list[Any]]:
-    """Load all classification datasets for a specific model and layer percents."""
+    """Load all classification datasets for a specific model and layer combination."""
     batch_size = get_batch_size(model_name)
 
     classification_dataset_loaders: list[ClassificationDatasetLoader] = []
@@ -211,7 +224,7 @@ def load_datasets_for_layer_percents(
             num_test=dcfg["num_test"],
             splits=dcfg["splits"],
             model_name=model_name,
-            layer_percents=layer_percents,
+            layer_combinations=[layer_combination],
             save_acts=True,
             batch_size=ds_batch_size,
         )
@@ -238,8 +251,8 @@ def run_eval_for_datasets(
     tokenizer,
     submodule,
     model_name: str,
-    layer_percents: list[int],
-    act_layers: list[int],
+    layer_combination: list[int],
+    act_layer_combination: list[int],
     lora_path: str | None,
     eval_data_by_ds: dict[str, list[Any]],
     batch_size: int,
@@ -266,8 +279,8 @@ def run_eval_for_datasets(
         "meta": {
             "model_name": model_name,
             "dtype": str(DTYPE),
-            "layer_percents": layer_percents,
-            "act_layers": act_layers,
+            "layer_combination": layer_combination,
+            "act_layer_combination": act_layer_combination,
             "injection_layer": INJECTION_LAYER,
             "investigator_lora_path": lora_path,
             "steering_coefficient": STEERING_COEFFICIENT,
@@ -310,7 +323,7 @@ def run_eval_for_datasets(
 
 
 # %%
-# Main loop over models and layer percents
+# Main loop over models and layer combinations
 
 for model_name in MODEL_CONFIGS:
     print(f"\n{'=' * 60}")
@@ -342,42 +355,44 @@ for model_name in MODEL_CONFIGS:
             active_lora_path = f"{LORA_DIR}{lora}"
             lora_name = lora.split("/")[-1].replace("/", "_").replace(".", "_")
 
-        layer_percents, act_layers = get_layer_spec_for_lora(model_name, active_lora_path)
-        layer_tag = "-".join(str(p) for p in layer_percents)
-        print(f"\n--- Layer percents: {layer_tag} ---")
+        for layer_combination, act_layer_combination in get_layer_specs_for_lora(model_name, active_lora_path):
+            layer_tag = "-".join(str(p) for p in layer_combination)
+            print(f"\n--- Layer combination: {layer_tag} ---")
 
-        run_dir = f"{EXPERIMENTS_DIR}/{DATA_DIR}/classification_{model_name_str}_{mode_str}_{layer_tag}/"
-        os.makedirs(run_dir, exist_ok=True)
+            run_dir = f"{EXPERIMENTS_DIR}/{DATA_DIR}/classification_{model_name_str}_{mode_str}_{layer_tag}/"
+            os.makedirs(run_dir, exist_ok=True)
 
-        cache_key = tuple(layer_percents)
-        if cache_key not in eval_data_cache:
-            all_eval_data = load_datasets_for_layer_percents(model_name, layer_percents, model_kwargs, model=model)
-            for ds_id, eval_data in all_eval_data.items():
-                for dp in eval_data:
-                    assert_eval_datapoint_layers(dp, act_layers)
-            eval_data_cache[cache_key] = all_eval_data
-            print(f"Loaded datasets: {list(all_eval_data.keys())}")
-        else:
-            all_eval_data = eval_data_cache[cache_key]
+            cache_key = tuple(layer_combination)
+            if cache_key not in eval_data_cache:
+                all_eval_data = load_datasets_for_layer_combination(
+                    model_name, layer_combination, model_kwargs, model=model
+                )
+                for ds_id, eval_data in all_eval_data.items():
+                    for dp in eval_data:
+                        assert_eval_datapoint_layers(dp, act_layer_combination)
+                eval_data_cache[cache_key] = all_eval_data
+                print(f"Loaded datasets: {list(all_eval_data.keys())}")
+            else:
+                all_eval_data = eval_data_cache[cache_key]
 
-        output_json_template = f"{run_dir}" + "classification_results_lora_{lora}.json"
+            output_json_template = f"{run_dir}" + "classification_results_lora_{lora}.json"
 
-        results = run_eval_for_datasets(
-            model=model,
-            tokenizer=tokenizer,
-            submodule=submodule,
-            model_name=model_name,
-            layer_percents=layer_percents,
-            act_layers=act_layers,
-            lora_path=active_lora_path,
-            eval_data_by_ds=all_eval_data,
-            batch_size=batch_size,
-        )
+            results = run_eval_for_datasets(
+                model=model,
+                tokenizer=tokenizer,
+                submodule=submodule,
+                model_name=model_name,
+                layer_combination=layer_combination,
+                act_layer_combination=act_layer_combination,
+                lora_path=active_lora_path,
+                eval_data_by_ds=all_eval_data,
+                batch_size=batch_size,
+            )
 
-        output_json = output_json_template.format(lora=lora_name)
-        with open(output_json, "w") as f:
-            json.dump(results, f, indent=2)
-        print(f"Saved results to {output_json}")
+            output_json = output_json_template.format(lora=lora_name)
+            with open(output_json, "w") as f:
+                json.dump(results, f, indent=2)
+            print(f"Saved results to {output_json}")
 
     # Clean up model before loading next one
     del model

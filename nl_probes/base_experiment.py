@@ -23,12 +23,12 @@ from nl_probes.utils.activation_utils import collect_activations_multiple_layers
 from nl_probes.utils.common import load_model, load_tokenizer, layer_percent_to_layer
 from nl_probes.utils.dataset_utils import TrainingDataPoint, create_training_datapoint
 from nl_probes.utils.eval import run_evaluation
+from nl_probes.configs.sft_config import SelfInterpTrainingConfig, read_training_config
 
 
 # ========================================
 # CONFIGURATION - edit here
 # ========================================
-
 
 @dataclass
 class VerbalizerEvalConfig:
@@ -42,14 +42,13 @@ class VerbalizerEvalConfig:
     model_name: str
 
     # these will be set in post_init
-    act_layers: list[int] = field(default_factory=list)
-    active_layer: int = -1
+    selected_act_layers: list[int] = field(default_factory=list)
 
     injection_layer: int = 1
-    layer_percents: list[int] = field(default_factory=lambda: [25, 50, 75])
+    layer_combinations: list[list[int]] = field(default_factory=lambda: [[25], [50], [75]])
 
-    # Layer 50% usually is a good default
-    selected_layer_percent: int = 50
+    # Default to a single middle layer
+    selected_layer_combination: list[int] = field(default_factory=lambda: [50])
 
     # IMPORTANT: We will apply the verbalizer to these activation types from the target model
     # default is all three types, but can be modified as needed
@@ -102,17 +101,14 @@ class VerbalizerEvalConfig:
         assert self.segment_start_idx < self.segment_end_idx, "segment_start_idx must be less than segment_end_idx"
         assert self.token_start_idx < self.token_end_idx, "token_start_idx must be less than token_end_idx"
 
-        act_layers = [layer_percent_to_layer(self.model_name, lp) for lp in self.layer_percents]
+        if self.selected_layer_combination not in self.layer_combinations:
+            raise ValueError(
+                f"selected_layer_combination {self.selected_layer_combination} must be in {self.layer_combinations}"
+            )
 
-        # a bit janky, just selecting the middle layer for activation collection
-        active_layer_idx = self.layer_percents.index(self.selected_layer_percent)
-        active_layer = act_layers[active_layer_idx]
-
-        self.act_layers = act_layers
-        self.active_layer = active_layer
-
-        if self.active_layer not in self.act_layers:
-            raise ValueError(f"active_layer ({self.active_layer}) must be in act_layers ({self.act_layers})")
+        self.selected_act_layers = [
+            layer_percent_to_layer(self.model_name, lp) for lp in self.selected_layer_combination
+        ]
 
         valid_act_types = {"orig", "lora", "diff"}
         invalid = set(self.activation_input_types) - valid_act_types
@@ -177,8 +173,7 @@ def create_verbalizer_inputs(
     acts_BLD_by_layer_dict: dict[int, torch.Tensor],
     context_input_ids: list[int],
     verbalizer_prompt: str,
-    act_layer: int,
-    prompt_layer: int,
+    prompt_layers: list[int],
     tokenizer: AutoTokenizer,
     config: VerbalizerEvalConfig,
     batch_idx: int = 0,
@@ -186,6 +181,17 @@ def create_verbalizer_inputs(
     base_meta: dict[str, Any] | None = None,
 ) -> list[TrainingDataPoint]:
     training_data: list[TrainingDataPoint] = []
+    assert len(prompt_layers) > 0, "prompt_layers must be non-empty"
+    for layer in prompt_layers:
+        assert layer in acts_BLD_by_layer_dict, f"Missing layer {layer} in activation dict"
+
+    def gather_acts(context_positions_abs: list[int]) -> torch.Tensor:
+        layer_acts: list[torch.Tensor] = []
+        for layer in prompt_layers:
+            acts_BLD = acts_BLD_by_layer_dict[layer][batch_idx, :]  # [L, D]
+            acts_BD = acts_BLD[context_positions_abs]  # [P, D]
+            layer_acts.append(acts_BD)
+        return torch.cat(layer_acts, dim=0)  # [num_layers * P, D]
 
     # Token-level probes
     if "tokens" in config.verbalizer_input_types:
@@ -198,8 +204,7 @@ def create_verbalizer_inputs(
         for i in range(token_start, token_end):
             context_positions_rel = [i]
             context_positions_abs = [left_pad + i]
-            acts_BLD = acts_BLD_by_layer_dict[act_layer][batch_idx, :]  # [L, D]
-            acts_BD = acts_BLD[context_positions_abs]  # [1, D]
+            acts_BD = gather_acts(context_positions_abs)
             meta = {"dp_kind": "tokens", "token_index": i}
             if base_meta is not None:
                 meta.update(base_meta)
@@ -207,7 +212,7 @@ def create_verbalizer_inputs(
                 datapoint_type="N/A",
                 prompt=verbalizer_prompt,
                 target_response="N/A",
-                layer=prompt_layer,
+                layers=prompt_layers,
                 num_positions=len(context_positions_rel),
                 tokenizer=tokenizer,
                 acts_BD=acts_BD,
@@ -231,8 +236,7 @@ def create_verbalizer_inputs(
         for _ in range(config.segment_repeats):
             context_positions_rel = list(range(segment_start, segment_end))
             context_positions_abs = [left_pad + p for p in context_positions_rel]
-            acts_BLD = acts_BLD_by_layer_dict[act_layer][batch_idx, :]  # [L, D]
-            acts_BD = acts_BLD[context_positions_abs]  # [L, D]
+            acts_BD = gather_acts(context_positions_abs)
             meta = {"dp_kind": "segment"}
             if base_meta is not None:
                 meta.update(base_meta)
@@ -240,7 +244,7 @@ def create_verbalizer_inputs(
                 datapoint_type="N/A",
                 prompt=verbalizer_prompt,
                 target_response="N/A",
-                layer=prompt_layer,
+                layers=prompt_layers,
                 num_positions=len(context_positions_rel),
                 tokenizer=tokenizer,
                 acts_BD=acts_BD,
@@ -257,8 +261,7 @@ def create_verbalizer_inputs(
         for _ in range(config.full_seq_repeats):
             context_positions_rel = list(range(len(context_input_ids)))
             context_positions_abs = [left_pad + p for p in context_positions_rel]
-            acts_BLD = acts_BLD_by_layer_dict[act_layer][batch_idx, :]  # [L, D]
-            acts_BD = acts_BLD[context_positions_abs]  # [L, D]
+            acts_BD = gather_acts(context_positions_abs)
             meta = {"dp_kind": "full_seq"}
             if base_meta is not None:
                 meta.update(base_meta)
@@ -266,7 +269,7 @@ def create_verbalizer_inputs(
                 datapoint_type="N/A",
                 prompt=verbalizer_prompt,
                 target_response="N/A",
-                layer=prompt_layer,
+                layers=prompt_layers,
                 num_positions=len(context_positions_rel),
                 tokenizer=tokenizer,
                 acts_BD=acts_BD,
@@ -335,7 +338,7 @@ def collect_target_activations(
         else:
             print("\n\n\n\nWarning: target_lora_path is None, collecting lora activations from base model")
         # setting submodules after setting the adapter - I don't think this matters but I'm paranoid
-        submodules = {layer: get_hf_submodule(model, layer) for layer in config.act_layers}
+        submodules = {layer: get_hf_submodule(model, layer) for layer in config.selected_act_layers}
         lora_acts = collect_activations_multiple_layers(
             model=model,
             submodules=submodules,
@@ -347,7 +350,7 @@ def collect_target_activations(
 
     if "orig" in config.activation_input_types:
         model.disable_adapters()
-        submodules = {layer: get_hf_submodule(model, layer) for layer in config.act_layers}
+        submodules = {layer: get_hf_submodule(model, layer) for layer in config.selected_act_layers}
         orig_acts = collect_activations_multiple_layers(
             model=model,
             submodules=submodules,
@@ -361,7 +364,7 @@ def collect_target_activations(
     if "diff" in config.activation_input_types:
         assert "lora" in act_types and "orig" in act_types, "Both lora and orig activations must be collected for diff"
         diff_acts = {}
-        for layer in config.act_layers:
+        for layer in config.selected_act_layers:
             diff_acts[layer] = act_types["lora"][layer] - act_types["orig"][layer]
             lora_sum = act_types["lora"][layer].sum().item()
             orig_sum = act_types["orig"][layer].sum().item()
@@ -482,8 +485,7 @@ def run_verbalizer(
                         acts_BLD_by_layer_dict=acts_dict,
                         context_input_ids=context_input_ids,
                         verbalizer_prompt=base["verbalizer_prompt"],
-                        act_layer=config.active_layer,
-                        prompt_layer=config.active_layer,
+                        prompt_layers=config.selected_act_layers,
                         tokenizer=tokenizer,
                         config=config,
                         batch_idx=b_idx,
@@ -576,7 +578,47 @@ def run_verbalizer(
     return results
 
 
-def load_lora_adapter(model: AutoModelForCausalLM, lora_path: str) -> str:
+def assert_training_config_matches_verbalizer_eval_config(
+    config: VerbalizerEvalConfig,
+    training_config: SelfInterpTrainingConfig,
+) -> None:
+    assert training_config.model_name == config.model_name, (
+        f"AO config model {training_config.model_name} != eval model {config.model_name}"
+    )
+
+    assert config.selected_layer_combination in training_config.layer_combinations, (
+        f"selected_layer_combination {config.selected_layer_combination} must exist in "
+        f"AO config layer_combinations {training_config.layer_combinations}"
+    )
+    selected_combo_idx = training_config.layer_combinations.index(config.selected_layer_combination)
+
+    assert 0 <= selected_combo_idx < len(training_config.layer_combinations), (
+        f"selected_combo_idx {selected_combo_idx} out of range for {len(training_config.layer_combinations)} combos"
+    )
+
+    layer_combo = training_config.layer_combinations[selected_combo_idx]
+
+    if training_config.act_layer_combinations:
+        act_layer_combo = training_config.act_layer_combinations[selected_combo_idx]
+    else:
+        act_layer_combo = [layer_percent_to_layer(config.model_name, lp) for lp in layer_combo]
+
+    expected_act_layers = [layer_percent_to_layer(config.model_name, lp) for lp in layer_combo]
+    assert act_layer_combo == expected_act_layers, (
+        f"act layers {act_layer_combo} do not match expected {expected_act_layers} for layer combo {layer_combo}"
+    )
+    assert config.selected_layer_combination == layer_combo, (
+        f"selected_layer_combination {config.selected_layer_combination} != AO combo {layer_combo}"
+    )
+    assert config.selected_act_layers == act_layer_combo, (
+        f"selected_act_layers {config.selected_act_layers} != AO act layers {act_layer_combo}"
+    )
+
+
+def load_plain_adapter(
+    model: AutoModelForCausalLM,
+    lora_path: str,
+) -> str:
     sanitized_lora_name = sanitize_lora_name(lora_path)
 
     if sanitized_lora_name not in model.peft_config:
@@ -589,3 +631,12 @@ def load_lora_adapter(model: AutoModelForCausalLM, lora_path: str) -> str:
         )
 
     return sanitized_lora_name
+
+
+def load_oracle_adapter(
+    model: AutoModelForCausalLM,
+    lora_path: str,
+) -> tuple[str, SelfInterpTrainingConfig]:
+    sanitized_lora_name = load_plain_adapter(model, lora_path)
+    training_config = read_training_config(lora_path)
+    return sanitized_lora_name, training_config

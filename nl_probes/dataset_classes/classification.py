@@ -52,9 +52,10 @@ class ClassificationDatasetLoader(ActDatasetLoader):
         self.model_kwargs = model_kwargs
         self.model = model
 
-        self.act_layers = [
-            layer_percent_to_layer(self.dataset_config.model_name, layer_percent)
-            for layer_percent in self.dataset_config.layer_percents
+        assert self.dataset_config.layer_combinations, "layer_combinations must be non-empty"
+        self.act_layer_combinations = [
+            [layer_percent_to_layer(self.dataset_config.model_name, layer_percent) for layer_percent in layer_combo]
+            for layer_combo in self.dataset_config.layer_combinations
         ]
 
         assert self.dataset_params.min_end_offset < 0, "Min end offset must be negative"
@@ -88,7 +89,7 @@ class ClassificationDatasetLoader(ActDatasetLoader):
                 tokenizer,
                 self.dataset_config.model_name,
                 self.dataset_config.batch_size,
-                self.act_layers,
+                self.act_layer_combinations,
                 min_end_offset=self.dataset_params.min_end_offset,
                 max_end_offset=self.dataset_params.max_end_offset,
                 max_window_size=self.dataset_params.max_window_size,
@@ -169,7 +170,7 @@ def create_vector_dataset(
     tokenizer: AutoTokenizer,
     model_name: str,
     batch_size: int,
-    act_layers: list[int],
+    act_layer_combinations: list[list[int]],
     min_end_offset: int,
     max_end_offset: int,
     max_window_size: int,
@@ -184,17 +185,19 @@ def create_vector_dataset(
     assert min_end_offset < 0, "Min end offset must be negative"
     assert max_end_offset < 0, "Max end offset must be negative"
     assert max_end_offset <= min_end_offset, "Max end offset must be less than or equal to min end offset"
+    assert act_layer_combinations, "act_layer_combinations must be non-empty"
     training_data = []
 
     assert tokenizer.padding_side == "left", "Padding side must be left"
     device = torch.device("cpu")
+    unique_layers = sorted({layer for layer_combo in act_layer_combinations for layer in layer_combo})
 
     if save_acts:
         if model is None:
             if model_kwargs is None:
                 model_kwargs = {}
             model = load_model(model_name, torch.bfloat16, **model_kwargs)
-        submodules = {layer: get_hf_submodule(model, layer) for layer in act_layers}
+        submodules = {layer: get_hf_submodule(model, layer) for layer in unique_layers}
         device = model.device
 
     if lora_path is not None:
@@ -222,6 +225,7 @@ def create_vector_dataset(
         tokenized_prompts["attention_mask"] = tokenized_prompts["attention_mask"]
 
         for j in range(len(batch_datapoints)):
+            act_layers = random.choice(act_layer_combinations)
             attn_mask_L = tokenized_prompts["attention_mask"][j].bool()
             input_ids_L = tokenized_prompts["input_ids"][j, attn_mask_L]
             L = len(input_ids_L)
@@ -307,7 +311,7 @@ if __name__ == "__main__":
     tokenizer = load_tokenizer(model_name)
 
     classification_dataset_loaders: list[ClassificationDatasetLoader] = []
-    layer_percents = [25, 50, 75]
+    layer_combinations = [[25, 50, 75]]
     batch_size = 16
     steering_coefficient = 2.0
     hook_layer = 1
@@ -328,7 +332,7 @@ if __name__ == "__main__":
             num_test=classification_datasets[dataset_name]["num_test"],
             splits=classification_datasets[dataset_name]["splits"],
             model_name=model_name,
-            layer_percents=layer_percents,
+            layer_combinations=layer_combinations,
             save_acts=False,
         )
 

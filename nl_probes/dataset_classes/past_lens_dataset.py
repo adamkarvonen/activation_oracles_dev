@@ -177,15 +177,17 @@ def collect_past_lens_acts(
     random.seed(dataset_config.seed)
     torch.manual_seed(dataset_config.seed)
 
-    layers = [
-        layer_percent_to_layer(dataset_config.model_name, layer_percent)
-        for layer_percent in dataset_config.layer_percents
+    assert dataset_config.layer_combinations, "layer_combinations must be non-empty"
+    act_layer_combinations = [
+        [layer_percent_to_layer(dataset_config.model_name, layer_percent) for layer_percent in layer_combo]
+        for layer_combo in dataset_config.layer_combinations
     ]
+    unique_layers = sorted({layer for layer_combo in act_layer_combinations for layer in layer_combo})
 
     device = torch.device("cpu")
     if dataset_config.save_acts:
         model = load_model(dataset_config.model_name, dtype)
-        submodules = {layer: get_hf_submodule(model, layer) for layer in layers}
+        submodules = {layer: get_hf_submodule(model, layer) for layer in unique_layers}
         device = model.device
 
     training_data = []
@@ -213,6 +215,7 @@ def collect_past_lens_acts(
         input_ids_BL = tokenized_inputs["input_ids"]
 
         for j in range(len(inputs)):
+            layers = random.choice(act_layer_combinations)
             attn_mask_L = attn_mask_BL[j].bool()
             input_ids_L_full = input_ids_BL[j, attn_mask_L]
             L = len(input_ids_L_full)
@@ -307,7 +310,7 @@ if __name__ == "__main__":
     device = torch.device("cuda")
     dtype = torch.bfloat16
 
-    layer_percents = [25, 50, 75]
+    layer_combinations = [[25, 50, 75]]
 
     batch_size = 128
     num_datapoints = 600_000
@@ -324,7 +327,7 @@ if __name__ == "__main__":
         num_test=0,
         splits=["train"],
         model_name=model_name,
-        layer_percents=layer_percents,
+        layer_combinations=layer_combinations,
         seed=seed,
         save_acts=True,
     )

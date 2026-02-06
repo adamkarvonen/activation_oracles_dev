@@ -400,3 +400,24 @@ def create_training_datapoint(
     )
 
     return training_data_point
+
+
+def assert_eval_datapoint_layers(dp: TrainingDataPoint, expected_layers: list[int]) -> None:
+    assert dp.layers == expected_layers, f"Expected layers {expected_layers}, got {dp.layers}"
+    if dp.context_positions is not None:
+        assert len(dp.positions) == len(dp.context_positions) * len(dp.layers)
+    if dp.steering_vectors is not None:
+        assert dp.steering_vectors.shape[0] == len(dp.positions)
+
+
+def assert_eval_datapoint_layers_in_combinations(
+    dp: TrainingDataPoint, expected_layer_combinations: list[list[int]]
+) -> None:
+    assert expected_layer_combinations, "expected_layer_combinations must be non-empty"
+    assert dp.layers in expected_layer_combinations, (
+        f"Expected layers in one of {expected_layer_combinations}, got {dp.layers}"
+    )
+    if dp.context_positions is not None:
+        assert len(dp.positions) == len(dp.context_positions) * len(dp.layers)
+    if dp.steering_vectors is not None:
+        assert dp.steering_vectors.shape[0] == len(dp.positions)

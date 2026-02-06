@@ -21,14 +21,17 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenize
 from transformers.optimization import get_linear_schedule_with_warmup
 import torch.distributed as dist
 import wandb
-from huggingface_hub import upload_file
 
 import nl_probes.dataset_classes.classification as classification
 from nl_probes.utils.steering_hooks import (
     add_hook,
     get_hf_activation_steering_hook,
 )
-from nl_probes.configs.sft_config import SelfInterpTrainingConfig
+from nl_probes.configs.sft_config import (
+    TRAINING_CONFIG_FILENAME,
+    SelfInterpTrainingConfig,
+    write_training_config,
+)
 from nl_probes.dataset_classes.act_dataset_manager import ActDatasetLoader, DatasetLoaderConfig
 from nl_probes.dataset_classes.classification import (
     ClassificationDatasetConfig,
@@ -51,11 +54,12 @@ from nl_probes.utils.dataset_utils import (
     EvalStepResult,
     FeatureResult,
     TrainingDataPoint,
+    assert_eval_datapoint_layers_in_combinations,
     construct_batch,
     materialize_missing_steering_vectors,
 )
 from nl_probes.utils.eval import run_evaluation, score_eval_responses
-from nl_probes.utils.mlao_utils import MLAO_CONFIG_FILENAME, assert_eval_datapoint_layers, write_mlao_config
+from huggingface_hub import upload_file
 
 
 def push_lora_to_hf(
@@ -63,7 +67,7 @@ def push_lora_to_hf(
     tokenizer: AutoTokenizer,
     repo_id: str,
     private: bool,
-    mlao_config_path: str | Path,
+    training_config_path: str | Path,
     commit_message: str = "Upload LoRA adapter after training",
 ) -> None:
     """
@@ -75,15 +79,15 @@ def push_lora_to_hf(
         repo_id: HuggingFace repository ID (e.g., "username/repo-name")
         commit_message: Commit message for the upload
         private: Whether to make the repository private
-        mlao_config_path: Path to mlao_config.json for this adapter
+        training_config_path: Path to self-interp training config for this adapter
 
     Returns:
         None
     """
 
     print(f"Pushing LoRA adapter to Hugging Face Hub: {repo_id}")
-    mlao_config_path = Path(mlao_config_path)
-    assert mlao_config_path.exists(), f"Missing MLAO config: {mlao_config_path}"
+    training_config_path = Path(training_config_path)
+    assert training_config_path.exists(), f"Missing training config: {training_config_path}"
 
     # Get the original model name to copy config from
     original_model_name = model.config._name_or_path
@@ -106,10 +110,10 @@ def push_lora_to_hf(
     )
 
     upload_file(
-        path_or_fileobj=str(mlao_config_path),
-        path_in_repo=MLAO_CONFIG_FILENAME,
         repo_id=repo_id,
-        commit_message="Add MLAO config",
+        path_or_fileobj=str(training_config_path),
+        path_in_repo=TRAINING_CONFIG_FILENAME,
+        commit_message="Add training config",
     )
 
     # Copy config.json from the original model
@@ -259,7 +263,7 @@ def eval_all_datasets(
     eval_results = {}
     for ds in eval_datasets:
         for dp in eval_datasets[ds]:
-            assert_eval_datapoint_layers(dp, cfg.act_layers)
+            assert_eval_datapoint_layers_in_combinations(dp, cfg.act_layer_combinations)
         eval_responses = run_evaluation(
             eval_data=eval_datasets[ds],
             model=model,
@@ -487,12 +491,7 @@ def train_model(
                     if rank == 0:
                         step_dir = Path(cfg.save_dir) / f"step_{global_step}"
                         model.save_pretrained(step_dir)
-                        write_mlao_config(
-                            step_dir,
-                            model_name=cfg.model_name,
-                            layer_percents=cfg.layer_percents,
-                            act_layers=cfg.act_layers,
-                        )
+                        write_training_config(step_dir, cfg)
                         if cfg.hf_push_to_hub and cfg.hf_repo_id:
                             print("Pushing LoRA adapter to Hugging Face Hub...")
                             push_lora_to_hf(
@@ -500,7 +499,7 @@ def train_model(
                                 tokenizer=tokenizer,
                                 repo_id=cfg.hf_repo_id + f"-step-{global_step}",
                                 private=cfg.hf_private_repo,
-                                mlao_config_path=step_dir / MLAO_CONFIG_FILENAME,
+                                training_config_path=step_dir / TRAINING_CONFIG_FILENAME,
                                 commit_message=(f"SAE introspection LoRA - {cfg.wandb_run_name} - step {global_step}"),
                             )
                             print("Pushed LoRA adapter to Hugging Face Hub.")
@@ -516,12 +515,7 @@ def train_model(
         print("Saving final model...")
         final_dir = Path(cfg.save_dir) / "final"
         model.save_pretrained(final_dir)
-        write_mlao_config(
-            final_dir,
-            model_name=cfg.model_name,
-            layer_percents=cfg.layer_percents,
-            act_layers=cfg.act_layers,
-        )
+        write_training_config(final_dir, cfg)
 
         # Final evaluation
         print("Running final evaluation...")
@@ -537,7 +531,7 @@ def train_model(
                 repo_id=cfg.hf_repo_id,
                 commit_message=f"SAE introspection LoRA - {cfg.wandb_run_name} - final model",
                 private=cfg.hf_private_repo,
-                mlao_config_path=final_dir / MLAO_CONFIG_FILENAME,
+                training_config_path=final_dir / TRAINING_CONFIG_FILENAME,
             )
     dist.barrier()
 
@@ -612,7 +606,7 @@ def mk_cfg(
     num_test: int,
     splits: list[str],
     model_name: str,
-    layer_percents: list[int],
+    layer_combinations: list[list[int]],
     save_acts: bool,
     batch_size: int,
 ) -> DatasetLoaderConfig:
@@ -622,7 +616,7 @@ def mk_cfg(
         num_test=num_test,
         splits=splits,
         model_name=model_name,
-        layer_percents=layer_percents,
+        layer_combinations=layer_combinations,
         save_acts=save_acts,
         batch_size=batch_size,
     )
@@ -631,7 +625,7 @@ def mk_cfg(
 def build_loader_groups(
     *,
     model_name: str,
-    layer_percents: list[int],
+    layer_combinations: list[list[int]],
     act_collection_batch_size: int,
     save_acts: bool,
     classification_datasets: dict[str, dict[str, Any]],
@@ -657,7 +651,7 @@ def build_loader_groups(
             num_test=0,
             splits=["train"],
             model_name=model_name,
-            layer_percents=layer_percents,
+            layer_combinations=layer_combinations,
             save_acts=save_acts,
             batch_size=train_batch_size,
         )
@@ -673,7 +667,7 @@ def build_loader_groups(
             num_test=0,
             splits=["train"],
             model_name=model_name,
-            layer_percents=layer_percents,
+            layer_combinations=layer_combinations,
             save_acts=save_acts,
             batch_size=train_batch_size,
         )
@@ -686,7 +680,7 @@ def build_loader_groups(
             num_test=0,
             splits=["train"],
             model_name=model_name,
-            layer_percents=layer_percents,
+            layer_combinations=layer_combinations,
             save_acts=False,
             batch_size=train_batch_size,
         )
@@ -695,7 +689,9 @@ def build_loader_groups(
     # SAE datasets per layer percent
     sae_loaders: list[ActDatasetLoader] = []
     sae_explanation_loaders: list[ActDatasetLoader] = []
-    for layer_percent in layer_percents:
+    for layer_combo in layer_combinations:
+        assert len(layer_combo) == 1, "SAE datasets only support single-layer combinations"
+        layer_percent = layer_combo[0]
         sft_data_path = (
             f"sae_data/qwen_hard_negatives_0_20000_layer_percent_{layer_percent}_sft_data_gpt-5-mini-2025-08-07.jsonl"
         )
@@ -711,7 +707,7 @@ def build_loader_groups(
                     num_test=0,
                     splits=["train"],
                     model_name=model_name,
-                    layer_percents=[layer_percent],
+                    layer_combinations=[[layer_percent]],
                     save_acts=True,
                     batch_size=0,
                 )
@@ -729,7 +725,7 @@ def build_loader_groups(
                     num_test=0,
                     splits=["train"],
                     model_name=model_name,
-                    layer_percents=[layer_percent],
+                    layer_combinations=[[layer_percent]],
                     save_acts=True,
                     batch_size=0,
                 )
@@ -744,7 +740,7 @@ def build_loader_groups(
                     num_test=0,
                     splits=["train"],
                     model_name=model_name,
-                    layer_percents=[layer_percent],
+                    layer_combinations=[[layer_percent]],
                     save_acts=True,
                     batch_size=0,
                 )
@@ -783,7 +779,7 @@ def build_loader_groups(
                     num_test=meta["num_test"],
                     splits=meta["splits"],
                     model_name=model_name,
-                    layer_percents=layer_percents,
+                    layer_combinations=layer_combinations,
                     save_acts=save_acts,
                     batch_size=bs,
                 ),
@@ -799,7 +795,7 @@ def build_loader_groups(
                     num_test=meta["num_test"],
                     splits=meta["splits"],
                     model_name=model_name,
-                    layer_percents=layer_percents,
+                    layer_combinations=layer_combinations,
                     save_acts=save_acts,
                     batch_size=train_batch_size,
                 ),
@@ -946,7 +942,7 @@ if __name__ == "__main__":
         train_batch_size = train_batch_size // world_size
         print(f"Per-rank train batch size: {train_batch_size}, world size: {world_size}")
 
-        layer_percents = [25, 50, 75]
+        layer_combinations = [[25, 50, 75]]
         save_acts = False
 
         gradient_accumulation_steps = 1
@@ -954,7 +950,7 @@ if __name__ == "__main__":
         # Build loader groups (single + multi variants)
         loader_groups = build_loader_groups(
             model_name=model_name,
-            layer_percents=layer_percents,
+            layer_combinations=layer_combinations,
             act_collection_batch_size=train_batch_size,
             save_acts=save_acts,
             classification_datasets=classification_datasets,
@@ -992,7 +988,7 @@ if __name__ == "__main__":
                 hook_onto_layer=hook_layer,
                 hf_repo_name=hf_repo_name,
                 # wandb_suffix=wandb_suffix,
-                layer_percents=layer_percents,
+                layer_combinations=layer_combinations,
                 train_batch_size=train_batch_size,
                 activation_collection_batch_size=train_batch_size * 4,
                 eval_batch_size=train_batch_size * 8,
