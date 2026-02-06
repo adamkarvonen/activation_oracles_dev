@@ -688,65 +688,65 @@ def build_loader_groups(
     )
 
     # SAE datasets per layer percent
-    sae_loaders: list[ActDatasetLoader] = []
-    sae_explanation_loaders: list[ActDatasetLoader] = []
-    for layer_combo in layer_combinations:
-        assert len(layer_combo) == 1, "SAE datasets only support single-layer combinations"
-        layer_percent = layer_combo[0]
-        sft_data_path = (
-            f"sae_data/qwen_hard_negatives_0_20000_layer_percent_{layer_percent}_sft_data_gpt-5-mini-2025-08-07.jsonl"
-        )
+    # sae_loaders: list[ActDatasetLoader] = []
+    # sae_explanation_loaders: list[ActDatasetLoader] = []
+    # for layer_combo in layer_combinations:
+    #     assert len(layer_combo) == 1, "SAE datasets only support single-layer combinations"
+    #     layer_percent = layer_combo[0]
+    #     sft_data_path = (
+    #         f"sae_data/qwen_hard_negatives_0_20000_layer_percent_{layer_percent}_sft_data_gpt-5-mini-2025-08-07.jsonl"
+    #     )
 
-        sae_explanation_loaders.append(
-            SAEExplanationDatasetLoader(
-                dataset_config=mk_cfg(
-                    SAEExplanationDatasetConfig(
-                        sft_data_file=sft_data_path,
-                        use_decoder_vectors=True,
-                    ),
-                    num_train=20000,
-                    num_test=0,
-                    splits=["train"],
-                    model_name=model_name,
-                    layer_combinations=[[layer_percent]],
-                    save_acts=True,
-                    batch_size=0,
-                )
-            )
-        )
+    #     sae_explanation_loaders.append(
+    #         SAEExplanationDatasetLoader(
+    #             dataset_config=mk_cfg(
+    #                 SAEExplanationDatasetConfig(
+    #                     sft_data_file=sft_data_path,
+    #                     use_decoder_vectors=True,
+    #                 ),
+    #                 num_train=20000,
+    #                 num_test=0,
+    #                 splits=["train"],
+    #                 model_name=model_name,
+    #                 layer_combinations=[[layer_percent]],
+    #                 save_acts=True,
+    #                 batch_size=0,
+    #             )
+    #         )
+    #     )
 
-        sae_loaders.append(
-            SAEActivatingSequencesDatasetLoader(
-                dataset_config=mk_cfg(
-                    SAEActivatingSequencesDatasetConfig(
-                        sae_repo_id="adamkarvonen/qwen3-8b-saes",
-                        use_decoder_vectors=True,
-                    ),
-                    num_train=60000,
-                    num_test=0,
-                    splits=["train"],
-                    model_name=model_name,
-                    layer_combinations=[[layer_percent]],
-                    save_acts=True,
-                    batch_size=0,
-                )
-            )
-        )
+    #     sae_loaders.append(
+    #         SAEActivatingSequencesDatasetLoader(
+    #             dataset_config=mk_cfg(
+    #                 SAEActivatingSequencesDatasetConfig(
+    #                     sae_repo_id="adamkarvonen/qwen3-8b-saes",
+    #                     use_decoder_vectors=True,
+    #                 ),
+    #                 num_train=60000,
+    #                 num_test=0,
+    #                 splits=["train"],
+    #                 model_name=model_name,
+    #                 layer_combinations=[[layer_percent]],
+    #                 save_acts=True,
+    #                 batch_size=0,
+    #             )
+    #         )
+    #     )
 
-        sae_loaders.append(
-            SAEYesNoDatasetLoader(
-                dataset_config=mk_cfg(
-                    SAEYesNoDatasetConfig(sft_data_file=sft_data_path),
-                    num_train=60000,
-                    num_test=0,
-                    splits=["train"],
-                    model_name=model_name,
-                    layer_combinations=[[layer_percent]],
-                    save_acts=True,
-                    batch_size=0,
-                )
-            )
-        )
+    #     sae_loaders.append(
+    #         SAEYesNoDatasetLoader(
+    #             dataset_config=mk_cfg(
+    #                 SAEYesNoDatasetConfig(sft_data_file=sft_data_path),
+    #                 num_train=60000,
+    #                 num_test=0,
+    #                 splits=["train"],
+    #                 model_name=model_name,
+    #                 layer_combinations=[[layer_percent]],
+    #                 save_acts=True,
+    #                 batch_size=0,
+    #             )
+    #         )
+    #     )
 
     # Classification: build both single-token and multi-token variants for each dataset
     classification_loaders: list[ActDatasetLoader] = []
@@ -808,8 +808,8 @@ def build_loader_groups(
         "past_lens_loaders": [past_lens_single, past_lens_multi],
         "latentqa_loaders": [latent_qa_loader],
         "classification_loaders": classification_loaders,
-        "sae_loaders": sae_loaders,
-        "sae_explanation_loaders": sae_explanation_loaders,
+        # "sae_loaders": sae_loaders,
+        # "sae_explanation_loaders": sae_explanation_loaders,
     }
 
 
@@ -840,6 +840,13 @@ def _ensure_datasets_exist(dataset_loaders: list[ActDatasetLoader]) -> None:
 
 
 if __name__ == "__main__":
+    """
+    Note: Because of vLLM generation of on policy data we have to run this in two steps:
+    python nl_probes/sft.py --gen-only ; torchrun --nproc_per_node=1 nl_probes/sft.py
+    First step generates the datasets on disk, second step trains the model.
+    vLLM will hang if ran in the same process as torch ddp
+    """
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--gen-only",
@@ -931,7 +938,7 @@ if __name__ == "__main__":
         # "google/gemma-3-4b-it",
         # "google/gemma-3-12b-it",
         # "google/gemma-3-27b-it",
-        "Qwen/Qwen3-4B",
+        "Qwen/Qwen3-8B",
     ]
 
     for model_name in models:
@@ -978,8 +985,8 @@ if __name__ == "__main__":
 
         classification_dataset_loaders = loader_groups["classification_loaders"]
         past_lens_loaders = loader_groups["past_lens_loaders"]
-        sae_dataset_loaders = loader_groups["sae_loaders"]
-        sae_explanation_dataset_loaders = loader_groups["sae_explanation_loaders"]
+        # sae_dataset_loaders = loader_groups["sae_loaders"]
+        # sae_explanation_dataset_loaders = loader_groups["sae_explanation_loaders"]
         latentqa_loaders = loader_groups["latentqa_loaders"]
 
         iterations = [
@@ -990,6 +997,11 @@ if __name__ == "__main__":
                 "dataset_loaders": latentqa_loaders + classification_dataset_loaders + past_lens_loaders,
                 "wandb_suffix": f"_latentqa_cls_past_lens_{model_name_str}",
             },
+            # {
+            #     "load_lora_path": None,
+            #     "dataset_loaders": past_lens_loaders,
+            #     "wandb_suffix": f"_past_lens_only_{model_name_str}",
+            # },
             # {
             #     "load_lora_path": None,
             #     "dataset_loaders": latentqa_loaders,
