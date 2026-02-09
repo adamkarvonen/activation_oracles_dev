@@ -137,16 +137,23 @@ def create_latentqa_training_datapoint(
     if positions == "window":
         window_size = random.randint(dataset_params.min_window_size, dataset_params.max_window_size)
 
-        end_offset = random.randint(dataset_params.max_end_offset, dataset_params.min_end_offset)
-        assert end_offset < 0, "end_offset must be negative"
+        if datapoint.source == "control":
+            end_offset = random.randint(dataset_params.max_end_offset, dataset_params.min_end_offset)
+            assert end_offset < 0, "end_offset must be negative"
 
-        if abs(end_offset) > len(context_positions):
-            end_offset = -len(context_positions) + 1
+            if abs(end_offset) > len(context_positions):
+                end_offset = -len(context_positions) + 1
 
-        window_size = min(window_size, (len(context_positions)) + end_offset)
+            window_size = min(window_size, (len(context_positions)) + end_offset)
 
-        window_start = end_offset - window_size
-        context_positions = context_positions[window_start:end_offset]
+            window_start = end_offset - window_size
+            context_positions = context_positions[window_start:end_offset]
+        else:
+            window_size = min(window_size, len(context_positions))
+            max_start = len(context_positions) - window_size
+            window_start = random.randint(0, max_start)
+            window_end = window_start + window_size
+            context_positions = context_positions[window_start:window_end]
 
     training_datapoint = create_training_datapoint(
         datapoint_type=f"latentqa_{datapoint.source}",
