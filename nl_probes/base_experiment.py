@@ -329,10 +329,12 @@ def collect_target_activations(
     target_lora_path: str | None,
 ) -> dict[str, dict[int, torch.Tensor]]:
     act_types = {}
+    is_peft_model = hasattr(model, "disable_adapter") and hasattr(model, "peft_config")
 
     # Collect activations for the whole batch under the active persona
     if "lora" in config.activation_input_types:
-        model.enable_adapters()
+        if not is_peft_model:
+            model.enable_adapters()
         if target_lora_path is not None:
             model.set_adapter(target_lora_path)
         else:
@@ -349,17 +351,29 @@ def collect_target_activations(
         act_types["lora"] = lora_acts
 
     if "orig" in config.activation_input_types:
-        model.disable_adapters()
-        submodules = {layer: get_hf_submodule(model, layer) for layer in config.selected_act_layers}
-        orig_acts = collect_activations_multiple_layers(
-            model=model,
-            submodules=submodules,
-            inputs_BL=inputs_BL,
-            min_offset=None,
-            max_offset=None,
-        )
-        act_types["orig"] = orig_acts
-        model.enable_adapters()
+        if is_peft_model:
+            with model.disable_adapter():
+                submodules = {layer: get_hf_submodule(model, layer) for layer in config.selected_act_layers}
+                orig_acts = collect_activations_multiple_layers(
+                    model=model,
+                    submodules=submodules,
+                    inputs_BL=inputs_BL,
+                    min_offset=None,
+                    max_offset=None,
+                )
+                act_types["orig"] = orig_acts
+        else:
+            model.disable_adapters()
+            submodules = {layer: get_hf_submodule(model, layer) for layer in config.selected_act_layers}
+            orig_acts = collect_activations_multiple_layers(
+                model=model,
+                submodules=submodules,
+                inputs_BL=inputs_BL,
+                min_offset=None,
+                max_offset=None,
+            )
+            act_types["orig"] = orig_acts
+            model.enable_adapters()
 
     if "diff" in config.activation_input_types:
         assert "lora" in act_types and "orig" in act_types, "Both lora and orig activations must be collected for diff"

@@ -135,24 +135,43 @@ def get_text_only_lora_targets(model_name: str) -> str | None:
 
 
 def get_hf_submodule(model: AutoModelForCausalLM, layer: int, use_lora: bool = False):
-    """Gets the residual stream submodule for HF transformers"""
+    """Gets the residual stream submodule for HF transformers."""
     model_name = model.config._name_or_path
 
-    if use_lora:
-        if "pythia" in model_name:
-            raise ValueError("Need to determine how to get submodule for LoRA")
-        elif "gemma-3" in model_name:
-            return model.base_model.language_model.layers[layer]
-        elif "gemma-2" in model_name or "mistral" in model_name or "Llama" in model_name or "Qwen" in model_name:
-            return model.base_model.model.model.layers[layer]
-        else:
-            raise ValueError(f"Please add submodule for model {model_name}")
-
     if "pythia" in model_name:
+        if use_lora:
+            raise ValueError("Need to determine how to get submodule for LoRA")
         return model.gpt_neox.layers[layer]
-    elif "gemma-3" in model_name:
-        return model.language_model.layers[layer]
+
+    if "gemma-3" in model_name:
+        candidate_paths = [
+            ("base_model", "model", "language_model", "layers"),
+            ("base_model", "language_model", "layers"),
+            ("model", "language_model", "layers"),
+            ("language_model", "layers"),
+        ]
     elif "gemma-2" in model_name or "mistral" in model_name or "Llama" in model_name or "Qwen" in model_name:
-        return model.model.layers[layer]
+        candidate_paths = [
+            ("base_model", "model", "model", "layers"),
+            ("base_model", "model", "layers"),
+            ("model", "model", "layers"),
+            ("model", "layers"),
+        ]
     else:
         raise ValueError(f"Please add submodule for model {model_name}")
+
+    for path in candidate_paths:
+        current = model
+        path_exists = True
+        for attr in path:
+            if not hasattr(current, attr):
+                path_exists = False
+                break
+            current = getattr(current, attr)
+        if path_exists:
+            return current[layer]
+
+    raise AssertionError(
+        f"Could not resolve transformer layers for model {model_name}. "
+        f"Tried attribute paths: {candidate_paths}"
+    )

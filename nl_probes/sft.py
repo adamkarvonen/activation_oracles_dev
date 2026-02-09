@@ -24,6 +24,16 @@ import torch.distributed as dist
 import wandb
 
 import nl_probes.dataset_classes.classification as classification
+from nl_probes.open_ended_eval.personaqa import (
+    build_default_personaqa_verbalizer_eval_config,
+    get_default_personaqa_model_settings,
+    run_personaqa_open_ended_eval,
+)
+from nl_probes.open_ended_eval.taboo import (
+    build_default_taboo_verbalizer_eval_config,
+    get_default_taboo_model_settings,
+    run_taboo_open_ended_eval,
+)
 from nl_probes.utils.steering_hooks import (
     add_hook,
     get_hf_activation_steering_hook,
@@ -61,6 +71,10 @@ from nl_probes.utils.dataset_utils import (
 )
 from nl_probes.utils.eval import run_evaluation, score_eval_responses
 from huggingface_hub import upload_file
+
+ENABLE_PERSONAQA_OPEN_ENDED_EVAL = True
+ENABLE_TABOO_OPEN_ENDED_EVAL = True
+TABOO_OPEN_ENDED_TRUNCATED = True
 
 
 def push_lora_to_hf(
@@ -295,6 +309,166 @@ def eval_all_datasets(
     gc.collect()
 
 
+def run_optional_open_ended_eval(
+    cfg: SelfInterpTrainingConfig,
+    model: AutoModelForCausalLM,
+    tokenizer: PreTrainedTokenizer,
+    device: torch.device,
+    global_step: int,
+    phase: str,
+) -> None:
+    if not ENABLE_PERSONAQA_OPEN_ENDED_EVAL and not ENABLE_TABOO_OPEN_ENDED_EVAL:
+        return
+
+    assert len(cfg.layer_combinations) > 0, "Expected at least one layer combination in training config"
+    selected_layer_combination = cfg.layer_combinations[0]
+
+    assert hasattr(model, "peft_config"), "Open-ended eval requires PEFT adapters on the training model"
+    assert hasattr(model, "active_adapters"), "Open-ended eval requires active_adapters on the training model"
+    active_adapters_before_eval = list(model.active_adapters)
+    assert len(active_adapters_before_eval) == 1, (
+        f"Expected exactly one active training adapter, found {active_adapters_before_eval}"
+    )
+    training_adapter_name = active_adapters_before_eval[0]
+    assert training_adapter_name in model.peft_config, (
+        f"Active adapter {training_adapter_name} not found in loaded adapters {list(model.peft_config.keys())}"
+    )
+
+    verbalizer_adapter_names: list[str | None] = [training_adapter_name]
+    model_was_training = model.training
+
+    def restore_training_adapter() -> None:
+        assert hasattr(model, "set_adapter"), "Expected set_adapter on training model during eval restore"
+        model.set_adapter(training_adapter_name)
+        active_adapters_after_eval = list(model.active_adapters)
+        assert active_adapters_after_eval == [training_adapter_name], (
+            f"Expected active adapter [{training_adapter_name}] after eval, found {active_adapters_after_eval}"
+        )
+        if model_was_training:
+            model.train()
+        else:
+            model.eval()
+
+    if ENABLE_PERSONAQA_OPEN_ENDED_EVAL:
+        personaqa_settings = get_default_personaqa_model_settings(cfg.model_name)
+        personaqa_config = build_default_personaqa_verbalizer_eval_config(
+            model_name=cfg.model_name,
+            segment_start=personaqa_settings["segment_start"],
+            selected_layer_combination=selected_layer_combination,
+        )
+
+        assert personaqa_config.selected_layer_combination in cfg.layer_combinations, (
+            f"selected_layer_combination {personaqa_config.selected_layer_combination} must exist in "
+            f"training config layer_combinations {cfg.layer_combinations}"
+        )
+        combo_idx = cfg.layer_combinations.index(personaqa_config.selected_layer_combination)
+        expected_act_layers = cfg.act_layer_combinations[combo_idx]
+        assert personaqa_config.selected_act_layers == expected_act_layers, (
+            f"selected_act_layers {personaqa_config.selected_act_layers} != expected {expected_act_layers}"
+        )
+
+        output_dir = Path(cfg.save_dir) / "open_ended_eval" / "personaqa"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_json_template = str(output_dir / f"{phase}_step_{global_step}_personaqa_{{lora}}.json")
+
+        summary = run_personaqa_open_ended_eval(
+            model_name=cfg.model_name,
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            config=personaqa_config,
+            target_lora_suffixes=personaqa_settings["target_lora_suffixes"],
+            target_lora_path_template=personaqa_settings["target_lora_path_template"],
+            verbalizer_adapter_names=verbalizer_adapter_names,
+            output_json_template=output_json_template,
+            max_personas=None,
+        )
+
+        restore_training_adapter()
+
+        overall_metrics = summary["overall_metrics"]
+        metric_payload = {
+            "open_ended/personaqa/full_sequence_accuracy": overall_metrics["full_sequence_accuracy"],
+            "open_ended/personaqa/segment_accuracy": overall_metrics["segment_accuracy"],
+            "open_ended/personaqa/token_accuracy": overall_metrics["token_accuracy"],
+        }
+        wandb.log(metric_payload, step=global_step)
+        wandb.summary.update(metric_payload)
+
+        summary_record = {
+            "phase": phase,
+            "global_step": global_step,
+            "metrics": overall_metrics,
+            "num_results": summary["num_results"],
+        }
+        summary_path = output_dir / "metrics_summary.jsonl"
+        with open(summary_path, "a") as f:
+            f.write(json.dumps(summary_record) + "\n")
+
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    if ENABLE_TABOO_OPEN_ENDED_EVAL:
+        taboo_settings = get_default_taboo_model_settings(cfg.model_name)
+        taboo_config = build_default_taboo_verbalizer_eval_config(
+            model_name=cfg.model_name,
+            segment_start=taboo_settings["segment_start"],
+            selected_layer_combination=selected_layer_combination,
+        )
+
+        assert taboo_config.selected_layer_combination in cfg.layer_combinations, (
+            f"selected_layer_combination {taboo_config.selected_layer_combination} must exist in "
+            f"training config layer_combinations {cfg.layer_combinations}"
+        )
+        combo_idx = cfg.layer_combinations.index(taboo_config.selected_layer_combination)
+        expected_act_layers = cfg.act_layer_combinations[combo_idx]
+        assert taboo_config.selected_act_layers == expected_act_layers, (
+            f"selected_act_layers {taboo_config.selected_act_layers} != expected {expected_act_layers}"
+        )
+
+        output_dir = Path(cfg.save_dir) / "open_ended_eval" / "taboo"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_json_template = str(output_dir / f"{phase}_step_{global_step}_taboo_{{lora}}.json")
+
+        summary = run_taboo_open_ended_eval(
+            model_name=cfg.model_name,
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            config=taboo_config,
+            target_lora_suffixes=taboo_settings["target_lora_suffixes"],
+            target_lora_path_template=taboo_settings["target_lora_path_template"],
+            verbalizer_adapter_names=verbalizer_adapter_names,
+            output_json_template=output_json_template,
+            truncated=TABOO_OPEN_ENDED_TRUNCATED,
+        )
+
+        restore_training_adapter()
+
+        overall_metrics = summary["overall_metrics"]
+        metric_payload = {
+            "open_ended/taboo/full_sequence_accuracy": overall_metrics["full_sequence_accuracy"],
+            "open_ended/taboo/segment_accuracy": overall_metrics["segment_accuracy"],
+            "open_ended/taboo/token_accuracy": overall_metrics["token_accuracy"],
+        }
+        wandb.log(metric_payload, step=global_step)
+        wandb.summary.update(metric_payload)
+
+        summary_record = {
+            "phase": phase,
+            "global_step": global_step,
+            "metrics": overall_metrics,
+            "num_results": summary["num_results"],
+            "truncated": TABOO_OPEN_ENDED_TRUNCATED,
+        }
+        summary_path = output_dir / "metrics_summary.jsonl"
+        with open(summary_path, "a") as f:
+            f.write(json.dumps(summary_record) + "\n")
+
+        torch.cuda.empty_cache()
+        gc.collect()
+
+
 def oom_preflight_check(
     cfg: SelfInterpTrainingConfig,
     training_data: list[TrainingDataPoint],
@@ -486,6 +660,14 @@ def train_model(
                 if global_step % cfg.eval_steps == 0 and (cfg.eval_on_start or global_step > 0):
                     if rank == 0:
                         eval_all_datasets(cfg, eval_datasets, model, tokenizer, submodule, device, dtype, global_step)
+                        run_optional_open_ended_eval(
+                            cfg=cfg,
+                            model=model,
+                            tokenizer=tokenizer,
+                            device=device,
+                            global_step=global_step,
+                            phase="periodic",
+                        )
                     dist.barrier()
 
                 if global_step % cfg.save_steps == 0 and global_step > 0:
@@ -521,6 +703,14 @@ def train_model(
         # Final evaluation
         print("Running final evaluation...")
         eval_all_datasets(cfg, eval_datasets, model, tokenizer, submodule, device, dtype, global_step)
+        run_optional_open_ended_eval(
+            cfg=cfg,
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            global_step=global_step,
+            phase="final",
+        )
         wandb.finish()
 
         # Push to Hugging Face if configured
@@ -633,7 +823,7 @@ def build_loader_groups(
     model_kwargs: dict[str, Any],
 ) -> dict[str, list[ActDatasetLoader]]:
     DEBUG = False
-    num_datapoints = 100_000
+    num_datapoints = 900_000
 
     # DEBUG = True
 
@@ -756,14 +946,14 @@ def build_loader_groups(
             max_window_size=1,
             min_end_offset=-1,
             max_end_offset=-5,
-            num_qa_per_sample=2,
+            num_qa_per_sample=6,
         )
         multi_params = ClassificationDatasetConfig(
             classification_dataset_name=ds_name,
             max_window_size=50,
             min_end_offset=-1,
             max_end_offset=-5,
-            num_qa_per_sample=1,
+            num_qa_per_sample=3,
         )
 
         # language identification has very long sequence lengths
@@ -995,7 +1185,7 @@ if __name__ == "__main__":
             {
                 "load_lora_path": None,
                 "dataset_loaders": latentqa_loaders + classification_dataset_loaders + past_lens_loaders,
-                "wandb_suffix": f"_latentqa_cls_past_lens_{model_name_str}",
+                "wandb_suffix": f"_latentqa_cls_on_policy_6x_{model_name_str}",
             },
             # {
             #     "load_lora_path": None,
