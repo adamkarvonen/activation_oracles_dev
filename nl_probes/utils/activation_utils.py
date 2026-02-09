@@ -1,6 +1,7 @@
 import contextlib
 
 import torch
+from peft import PeftModel
 from transformers import AutoModelForCausalLM
 
 
@@ -135,43 +136,30 @@ def get_text_only_lora_targets(model_name: str) -> str | None:
 
 
 def get_hf_submodule(model: AutoModelForCausalLM, layer: int, use_lora: bool = False):
-    """Gets the residual stream submodule for HF transformers."""
-    model_name = model.config._name_or_path
+    """Gets the residual stream submodule for HF transformers.
 
-    if "pythia" in model_name:
+    This intentionally uses explicit model-family/backend paths and fails loudly
+    when a new structure appears.
+    """
+    model_name = model.config._name_or_path
+    model_name_lower = model_name.lower()
+    is_peft_model = isinstance(model, PeftModel)
+
+    if "pythia" in model_name_lower:
         if use_lora:
             raise ValueError("Need to determine how to get submodule for LoRA")
+        if is_peft_model:
+            return model.base_model.model.gpt_neox.layers[layer]
         return model.gpt_neox.layers[layer]
 
-    if "gemma-3" in model_name:
-        candidate_paths = [
-            ("base_model", "model", "language_model", "layers"),
-            ("base_model", "language_model", "layers"),
-            ("model", "language_model", "layers"),
-            ("language_model", "layers"),
-        ]
-    elif "gemma-2" in model_name or "mistral" in model_name or "Llama" in model_name or "Qwen" in model_name:
-        candidate_paths = [
-            ("base_model", "model", "model", "layers"),
-            ("base_model", "model", "layers"),
-            ("model", "model", "layers"),
-            ("model", "layers"),
-        ]
-    else:
-        raise ValueError(f"Please add submodule for model {model_name}")
+    if "gemma-3" in model_name_lower:
+        if is_peft_model:
+            return model.base_model.model.language_model.layers[layer]
+        return model.language_model.layers[layer]
 
-    for path in candidate_paths:
-        current = model
-        path_exists = True
-        for attr in path:
-            if not hasattr(current, attr):
-                path_exists = False
-                break
-            current = getattr(current, attr)
-        if path_exists:
-            return current[layer]
+    if "gemma-2" in model_name_lower or "mistral" in model_name_lower or "llama" in model_name_lower or "qwen" in model_name_lower:
+        if is_peft_model:
+            return model.base_model.model.model.layers[layer]
+        return model.model.layers[layer]
 
-    raise AssertionError(
-        f"Could not resolve transformer layers for model {model_name}. "
-        f"Tried attribute paths: {candidate_paths}"
-    )
+    raise ValueError(f"Please add submodule for model {model_name}")

@@ -323,8 +323,7 @@ def run_optional_open_ended_eval(
     assert len(cfg.layer_combinations) > 0, "Expected at least one layer combination in training config"
     selected_layer_combination = cfg.layer_combinations[0]
 
-    assert hasattr(model, "peft_config"), "Open-ended eval requires PEFT adapters on the training model"
-    assert hasattr(model, "active_adapters"), "Open-ended eval requires active_adapters on the training model"
+    assert isinstance(model, PeftModel), "Open-ended eval requires a PEFT training model"
     active_adapters_before_eval = list(model.active_adapters)
     assert len(active_adapters_before_eval) == 1, (
         f"Expected exactly one active training adapter, found {active_adapters_before_eval}"
@@ -338,7 +337,6 @@ def run_optional_open_ended_eval(
     model_was_training = model.training
 
     def restore_training_adapter() -> None:
-        assert hasattr(model, "set_adapter"), "Expected set_adapter on training model during eval restore"
         model.set_adapter(training_adapter_name)
         active_adapters_after_eval = list(model.active_adapters)
         assert active_adapters_after_eval == [training_adapter_name], (

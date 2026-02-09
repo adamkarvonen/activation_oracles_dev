@@ -15,7 +15,7 @@ from dataclasses import dataclass, field, asdict
 
 import torch
 from huggingface_hub import snapshot_download
-from peft import LoraConfig
+from peft import LoraConfig, PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # nl_probes imports
@@ -329,7 +329,7 @@ def collect_target_activations(
     target_lora_path: str | None,
 ) -> dict[str, dict[int, torch.Tensor]]:
     act_types = {}
-    is_peft_model = hasattr(model, "disable_adapter") and hasattr(model, "peft_config")
+    is_peft_model = isinstance(model, PeftModel)
 
     # Collect activations for the whole batch under the active persona
     if "lora" in config.activation_input_types:
