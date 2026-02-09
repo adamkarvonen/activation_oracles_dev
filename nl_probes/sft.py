@@ -70,11 +70,19 @@ from nl_probes.utils.dataset_utils import (
     materialize_missing_steering_vectors,
 )
 from nl_probes.utils.eval import run_evaluation, score_eval_responses
-from huggingface_hub import upload_file
+from huggingface_hub import repo_exists, upload_file
 
 ENABLE_PERSONAQA_OPEN_ENDED_EVAL = True
 ENABLE_TABOO_OPEN_ENDED_EVAL = True
 TABOO_OPEN_ENDED_TRUNCATED = True
+
+
+def resolve_lora_source(path_or_repo: str) -> str | Path:
+    local_path = Path(path_or_repo)
+    if local_path.exists():
+        return local_path
+    assert repo_exists(path_or_repo), f"LoRA source not found locally or on Hugging Face Hub: {path_or_repo}"
+    return path_or_repo
 
 
 def push_lora_to_hf(
@@ -545,9 +553,8 @@ def train_model(
         )
         model = get_peft_model(model, lora_config, autocast_adapter_dtype=True)
     elif cfg.load_lora_path is not None:
-        load_lora_path = Path(cfg.load_lora_path)
-        assert load_lora_path.exists()
-        model = PeftModel.from_pretrained(model, load_lora_path, is_trainable=True, autocast_adapter_dtype=True)
+        lora_source = resolve_lora_source(cfg.load_lora_path)
+        model = PeftModel.from_pretrained(model, lora_source, is_trainable=True, autocast_adapter_dtype=True)
 
     model.print_trainable_parameters()
 
@@ -821,7 +828,7 @@ def build_loader_groups(
     model_kwargs: dict[str, Any],
 ) -> dict[str, list[ActDatasetLoader]]:
     DEBUG = False
-    num_datapoints = 900_000
+    num_datapoints = 100_000
 
     # DEBUG = True
 
@@ -1030,7 +1037,7 @@ def _ensure_datasets_exist(dataset_loaders: list[ActDatasetLoader]) -> None:
 if __name__ == "__main__":
     """
     Note: Because of vLLM generation of on policy data we have to run this in two steps:
-    python nl_probes/sft.py --gen-only ; torchrun --nproc_per_node=1 nl_probes/sft.py
+    python nl_probes/sft.py --gen-only && torchrun --nproc_per_node=1 nl_probes/sft.py
     First step generates the datasets on disk, second step trains the model.
     vLLM will hang if ran in the same process as torch ddp
     """
@@ -1181,9 +1188,9 @@ if __name__ == "__main__":
             # Default dataset mixture
             # Set load_lora_path to checkpoint path to continue training
             {
-                "load_lora_path": None,
+                "load_lora_path": "adamkarvonen/checkpoints_latentqa_cls_on_policy_3x_Qwen3-8B",
                 "dataset_loaders": latentqa_loaders + classification_dataset_loaders + past_lens_loaders,
-                "wandb_suffix": f"_latentqa_cls_on_policy_6x_{model_name_str}",
+                "wandb_suffix": f"_latentqa_cls_on_policy_3x_posttrain_1x_{model_name_str}",
             },
             # {
             #     "load_lora_path": None,
@@ -1200,7 +1207,7 @@ if __name__ == "__main__":
         for hyperparam_override in iterations:
             loop_dataset_loaders = hyperparam_override.pop("dataset_loaders")
             if hyperparam_override["load_lora_path"] is not None:
-                assert os.path.exists(hyperparam_override["load_lora_path"]), f"{hyperparam_override['load_lora_path']}"
+                resolve_lora_source(hyperparam_override["load_lora_path"])
 
             cfg = SelfInterpTrainingConfig(
                 model_name=model_name,

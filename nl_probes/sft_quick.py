@@ -53,6 +53,7 @@ def build_quick_past_lens_loader(
 
 
 if __name__ == "__main__":
+    """python nl_probes/sft_quick.py --gen-only && torchrun --nproc_per_node=1 nl_probes/sft_quick.py"""
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--gen-only",
